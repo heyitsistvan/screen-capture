@@ -1,58 +1,92 @@
-//! The full-screen capture overlay: a frozen screenshot on which the user
-//! picks an area (drag, or click a window), annotates it, then copies/saves
-//! it or starts a GIF recording of it.
+//! The capture editor: a frozen screenshot on which the user picks an area
+//! (drag, or click a window), annotates it, then copies/saves it or starts a
+//! GIF recording of it.
 //!
-//! Rendering: the window is backed by one screen-sized DIB. A paint recomposes
-//! only the invalidated rectangles from the dimmed screenshot, the annotated
-//! selection and the UI chrome. The annotated selection is cached:
-//! `committed` holds finished shapes, `comp` adds the shape being drawn.
+//! It's platform-independent: a window shell (Windows or Linux) feeds it input,
+//! presents its back buffer and carries out the [`Action`]s it returns; the
+//! editor reaches the window only through [`Host`].
+//!
+//! Rendering: a screen-sized back buffer. A render recomposes only the given
+//! rectangles from the dimmed screenshot, the annotated selection and the UI
+//! chrome. The annotated selection is cached: `committed` holds finished
+//! shapes, `comp` adds the shape being drawn.
 
-use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
-use std::path::PathBuf;
-use std::ptr::{null, null_mut};
+use std::cell::Cell;
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{BOOL, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateRectRgn, DeleteObject, EndPaint, EnumDisplayMonitors, GetMonitorInfoW, GetRegionData,
-    GetUpdateRgn, InvalidateRect, UpdateWindow, HDC, HMONITOR, MONITORINFO, PAINTSTRUCT, RGNDATAHEADER, SRCCOPY,
-};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::SystemServices::MK_SHIFT;
-use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    ChooseColorW, GetSaveFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, OFN_EXPLORER, OFN_NOCHANGEDIR,
-    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT,
-    VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_UP,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_DBLCLKS, GWLP_USERDATA, GWL_EXSTYLE,
-    HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, IDC_WAIT, MB_ICONERROR, SWP_SHOWWINDOW, SW_SHOW, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-};
-
 use crate::annotate::{self, Pt, Rgba, Shape, Tool};
-use crate::capture::{self, Dib};
-use crate::clipboard;
-use crate::gif_rec::GifRequest;
 use crate::text::{self, Fonts};
 use crate::ui::{Canvas, Icon};
-use crate::util::{self, wide, Rect};
-use crate::{WM_APP_OVERLAY_DONE, WM_APP_START_GIF};
+use crate::util::Rect;
 
-const CLASS: &str = "ScreenCaptureOverlay";
+/// What the editor needs from the window it runs in.
+pub trait Host {
+    /// Repaint this area (editor coordinates) soon.
+    fn invalidate(&mut self, r: Rect);
+    fn set_cursor(&mut self, c: Cursor);
+    /// Call [`Editor::on_timer`] with `id` every `ms` milliseconds until killed.
+    fn set_timer(&mut self, id: usize, ms: u32);
+    fn kill_timer(&mut self, id: usize);
+    /// Keep delivering mouse events while the button is held, even outside.
+    fn capture_mouse(&mut self, on: bool);
+    fn clipboard_text(&mut self) -> Option<String>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cursor {
+    Arrow,
+    Cross,
+    Hand,
+    IBeam,
+    Move,
+    SizeNS,
+    SizeWE,
+    SizeNWSE,
+    SizeNESW,
+    Wait,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub shift: bool,
+}
+
+/// Key codes for [`Editor::on_key`] (Windows virtual-key values); letters are
+/// passed as their uppercase ASCII code.
+pub mod key {
+    pub const BACKSPACE: u16 = 0x08;
+    pub const ENTER: u16 = 0x0D;
+    pub const ESCAPE: u16 = 0x1B;
+    pub const LEFT: u16 = 0x25;
+    pub const UP: u16 = 0x26;
+    pub const RIGHT: u16 = 0x27;
+    pub const DOWN: u16 = 0x28;
+    pub const DELETE: u16 = 0x2E;
+}
+
+/// A frozen screenshot and the layout it was taken from, in editor
+/// coordinates (the screenshot's top-left is (0, 0)).
+pub struct Screen {
+    pub w: i32,
+    pub h: i32,
+    /// Opaque BGRA.
+    pub pixels: Vec<u8>,
+    pub monitors: Vec<Rect>,
+    /// Top-level windows, topmost first, for click-to-select (may be empty).
+    pub windows: Vec<Rect>,
+    pub mouse: (i32, i32),
+    /// Screen position of (0, 0); GIF regions are reported in screen space.
+    pub origin: (i32, i32),
+}
+
+/// What the editor hands over when the user starts a GIF recording.
+pub struct GifRequest {
+    /// Area to record, in screen coordinates.
+    pub region: Rect,
+    /// Annotations to burn into every frame, relative to the region.
+    pub shapes: Vec<Shape>,
+}
 
 const ACCENT: Rgba = Rgba(10, 132, 255, 255);
 const WHITE: Rgba = Rgba(255, 255, 255, 255);
@@ -173,8 +207,6 @@ thread_local! {
             outline_custom: Rgba(255, 214, 10, 255),
         })
     };
-    static CUSTOM_COLORS: Cell<[u32; 16]> = const { Cell::new([0x00FF_FFFF; 16]) };
-    static SAVE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -273,9 +305,9 @@ struct TextEdit {
     original: Option<(usize, Shape)>,
 }
 
-/// Things done after the handler returns, outside any borrow of the overlay,
-/// because they run modal loops or destroy the window.
-enum Action {
+/// Things the window shell does after an input handler returns, because they
+/// run modal dialogs, touch the clipboard or close the window.
+pub enum Action {
     Close,
     Copy,
     Save,
@@ -304,9 +336,8 @@ enum Part {
     Flash,
 }
 
-pub struct Overlay {
-    hwnd: HWND,
-    main: HWND,
+pub struct Editor {
+    host: Box<dyn Host>,
     gif_mode: bool,
     /// Screen position of the window's (0, 0).
     ox: i32,
@@ -315,7 +346,7 @@ pub struct Overlay {
     h: i32,
     shot: Vec<u8>,
     dim: Vec<u8>,
-    back: Dib,
+    back: Vec<u8>,
     fonts: Arc<Fonts>,
     scale: f32,
     monitors: Vec<Rect>,
@@ -335,7 +366,6 @@ pub struct Overlay {
     current: Option<Shape>,
     edit: Option<TextEdit>,
     caret_on: bool,
-    high_surrogate: Option<u16>,
     committed: Vec<u8>,
     committed_ok: bool,
     comp: Vec<u8>,
@@ -343,271 +373,6 @@ pub struct Overlay {
     palette_open: bool,
     flash: Option<String>,
     last_parts: Vec<(Part, Rect)>,
-}
-
-pub fn register_class(hinst: windows_sys::Win32::Foundation::HINSTANCE) {
-    let cls = wide(CLASS);
-    unsafe {
-        let mut wc: WNDCLASSEXW = std::mem::zeroed();
-        wc.cbSize = size_of::<WNDCLASSEXW>() as u32;
-        wc.style = CS_DBLCLKS;
-        wc.lpfnWndProc = Some(wndproc);
-        wc.hInstance = hinst;
-        wc.lpszClassName = cls.as_ptr();
-        RegisterClassExW(&wc);
-    }
-}
-
-/// Captures the screen and shows the overlay. Returns the overlay window or
-/// null on failure.
-pub fn open(main: HWND, gif_mode: bool, fonts: Arc<Fonts>) -> HWND {
-    let Some(ov) = Overlay::new(main, gif_mode, fonts) else {
-        return null_mut();
-    };
-    let (x, y, w, h) = (ov.ox, ov.oy, ov.w, ov.h);
-    unsafe {
-        let cls = wide(CLASS);
-        let title = wide(util::APP_NAME);
-        let p = Box::into_raw(ov);
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            cls.as_ptr(),
-            title.as_ptr(),
-            WS_POPUP,
-            x,
-            y,
-            w,
-            h,
-            null_mut(),
-            null_mut(),
-            GetModuleHandleW(null()),
-            p as *const c_void,
-        );
-        if hwnd.is_null() {
-            // Ownership is unclear if creation failed half-way; leak rather
-            // than risk a double free.
-            return null_mut();
-        }
-        ShowWindow(hwnd, SW_SHOW);
-        SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
-        force_foreground(hwnd);
-        UpdateWindow(hwnd);
-        hwnd
-    }
-}
-
-/// Takes the foreground even when triggered from a background hotkey.
-unsafe fn force_foreground(hwnd: HWND) {
-    let fg = GetForegroundWindow();
-    let fg_thread = if fg.is_null() { 0 } else { GetWindowThreadProcessId(fg, null_mut()) };
-    let me = GetCurrentThreadId();
-    let attach = fg_thread != 0 && fg_thread != me;
-    if attach {
-        AttachThreadInput(me, fg_thread, TRUE);
-    }
-    BringWindowToTop(hwnd);
-    SetForegroundWindow(hwnd);
-    SetFocus(hwnd);
-    if attach {
-        AttachThreadInput(me, fg_thread, FALSE);
-    }
-}
-
-fn lparam_xy(lp: LPARAM) -> (i32, i32) {
-    ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32)
-}
-
-fn key_down(vk: u16) -> bool {
-    unsafe { GetKeyState(vk as i32) < 0 }
-}
-
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_NCCREATE {
-        let cs = &*(lp as *const CREATESTRUCTW);
-        let p = cs.lpCreateParams as *mut Overlay;
-        (*p).hwnd = hwnd;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, p as isize);
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
-    // WM_CAPTURECHANGED is sent synchronously from ReleaseCapture inside our
-    // own handlers; don't re-enter the overlay for it.
-    if p.is_null() || msg == WM_CAPTURECHANGED {
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    if msg == WM_NCDESTROY {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        let ov = Box::from_raw(p);
-        PREFS.with(|c| c.set(ov.prefs));
-        PostMessageW(ov.main, WM_APP_OVERLAY_DONE, hwnd as WPARAM, 0);
-        drop(ov);
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    let (res, action) = (*p).handle(msg, wp, lp);
-    if let Some(a) = action {
-        perform(hwnd, p, a);
-    }
-    match res {
-        Some(r) => r,
-        None => DefWindowProcW(hwnd, msg, wp, lp),
-    }
-}
-
-unsafe fn perform(hwnd: HWND, p: *mut Overlay, action: Action) {
-    match action {
-        Action::Close => {
-            DestroyWindow(hwnd);
-        }
-        Action::Copy => {
-            if let Some((w, h, px)) = (*p).final_image() {
-                clipboard::set_image(hwnd, w, h, &px);
-            }
-            DestroyWindow(hwnd);
-        }
-        Action::Save => {
-            let Some((w, h, px)) = (*p).final_image() else { return };
-            let Some(path) = save_dialog(hwnd) else { return };
-            match capture::encode_png(w, h, &px).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()))
-            {
-                Ok(()) => {
-                    DestroyWindow(hwnd);
-                }
-                Err(e) => util::message_box(hwnd, &format!("Could not save {}:\n{e}", path.display()), MB_ICONERROR),
-            }
-        }
-        Action::Gif => {
-            if let Some(req) = (*p).gif_request() {
-                let main = (*p).main;
-                PostMessageW(main, WM_APP_START_GIF, 0, Box::into_raw(Box::new(req)) as LPARAM);
-            }
-            DestroyWindow(hwnd);
-        }
-        Action::ChooseColor => {
-            let cur = (*p).prefs.color;
-            if let Some(c) = choose_color(hwnd, cur) {
-                (*p).set_color(c);
-            }
-        }
-        Action::CopyColor => {
-            let hex = (*p).color_under_cursor();
-            let ok = clipboard::set_text(hwnd, &hex);
-            (*p).show_flash(if ok { format!("Copied {hex}") } else { "Clipboard busy, try again".into() });
-        }
-        Action::ChooseOutlineColor => {
-            let cur = (*p).prefs.outline_custom;
-            if let Some(c) = choose_color(hwnd, cur) {
-                (*p).prefs.outline_custom = c;
-                (*p).set_outline(OutlineMode::Custom);
-            }
-        }
-    }
-}
-
-unsafe fn save_dialog(owner: HWND) -> Option<PathBuf> {
-    let dir = SAVE_DIR.with(|d| d.borrow().clone()).unwrap_or_else(util::pictures_dir);
-    let name = format!("Screenshot_{}.png", util::timestamp());
-    let mut file = [0u16; 1024];
-    for (i, c) in name.encode_utf16().take(file.len() - 1).enumerate() {
-        file[i] = c;
-    }
-    let filter: Vec<u16> = "PNG image (*.png)\0*.png\0\0".encode_utf16().collect();
-    let dir_w = util::wide_path(&dir);
-    let def_ext = wide("png");
-    let title = wide("Save screenshot");
-    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
-    ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
-    ofn.hwndOwner = owner;
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.lpstrFile = file.as_mut_ptr();
-    ofn.nMaxFile = file.len() as u32;
-    ofn.lpstrInitialDir = dir_w.as_ptr();
-    ofn.lpstrDefExt = def_ext.as_ptr();
-    ofn.lpstrTitle = title.as_ptr();
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if GetSaveFileNameW(&mut ofn) == 0 {
-        return None;
-    }
-    let path = util::path_from_wide(&file);
-    if let Some(parent) = path.parent() {
-        SAVE_DIR.with(|d| *d.borrow_mut() = Some(parent.to_path_buf()));
-    }
-    Some(path)
-}
-
-unsafe fn choose_color(owner: HWND, cur: Rgba) -> Option<Rgba> {
-    let mut custom = CUSTOM_COLORS.with(|c| c.get());
-    let mut cc: CHOOSECOLORW = std::mem::zeroed();
-    cc.lStructSize = size_of::<CHOOSECOLORW>() as u32;
-    cc.hwndOwner = owner;
-    cc.rgbResult = cur.0 as u32 | (cur.1 as u32) << 8 | (cur.2 as u32) << 16;
-    cc.lpCustColors = custom.as_mut_ptr();
-    cc.Flags = CC_RGBINIT | CC_FULLOPEN;
-    let ok = ChooseColorW(&mut cc) != 0;
-    CUSTOM_COLORS.with(|c| c.set(custom));
-    let c = cc.rgbResult;
-    ok.then_some(Rgba(c as u8, (c >> 8) as u8, (c >> 16) as u8, 255))
-}
-
-/// Visible top-level windows in z-order (topmost first), screen coordinates.
-fn enum_windows() -> Vec<Rect> {
-    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
-        let out = &mut *(lp as *mut Vec<Rect>);
-        if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
-            return TRUE;
-        }
-        if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0 {
-            return TRUE;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == GetCurrentProcessId() {
-            return TRUE;
-        }
-        let mut cloaked = 0u32;
-        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut c_void, 4);
-        if cloaked != 0 {
-            return TRUE;
-        }
-        let mut name = [0u16; 64];
-        let n = GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32).max(0) as usize;
-        let class = String::from_utf16_lossy(&name[..n]);
-        if class == "Progman" || class == "WorkerW" {
-            return TRUE; // the desktop: clicking it selects the monitor instead
-        }
-        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
-            &mut r as *mut RECT as *mut c_void,
-            size_of::<RECT>() as u32,
-        ) != 0
-        {
-            GetWindowRect(hwnd, &mut r);
-        }
-        let r = Rect::from_win(&r);
-        if r.w() >= 8 && r.h() >= 8 {
-            out.push(r);
-        }
-        TRUE
-    }
-    let mut v: Vec<Rect> = Vec::new();
-    unsafe { EnumWindows(Some(cb), &mut v as *mut Vec<Rect> as LPARAM) };
-    v
-}
-
-fn enum_monitors() -> Vec<Rect> {
-    unsafe extern "system" fn cb(mon: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
-        let out = &mut *(lp as *mut Vec<Rect>);
-        let mut mi: MONITORINFO = std::mem::zeroed();
-        mi.cbSize = size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(mon, &mut mi) != 0 {
-            out.push(Rect::from_win(&mi.rcMonitor));
-        }
-        TRUE
-    }
-    let mut v: Vec<Rect> = Vec::new();
-    unsafe { EnumDisplayMonitors(null_mut(), null(), Some(cb), &mut v as *mut Vec<Rect> as LPARAM) };
-    v
 }
 
 /// Copies rectangle `r` (destination coordinates) from `src`, whose pixel
@@ -629,25 +394,6 @@ fn frame_px(cv: &mut Canvas, r: Rect, t: i32, c: Rgba) {
     cv.fill_px(Rect::new(r.r - t, r.t + t, r.r, r.b - t), c);
 }
 
-/// Rectangles of a GDI region (falls back to its bounding box).
-unsafe fn region_rects(rgn: windows_sys::Win32::Graphics::Gdi::HRGN, fallback: Rect) -> Vec<Rect> {
-    let size = GetRegionData(rgn, 0, null_mut());
-    if size == 0 {
-        return vec![fallback];
-    }
-    let mut buf = vec![0u64; (size as usize + 7) / 8];
-    if GetRegionData(rgn, size, buf.as_mut_ptr() as *mut _) == 0 {
-        return vec![fallback];
-    }
-    let hdr = &*(buf.as_ptr() as *const RGNDATAHEADER);
-    let n = hdr.nCount as usize;
-    if n == 0 || n > 64 {
-        return vec![fallback];
-    }
-    let rects = (buf.as_ptr() as *const u8).add(hdr.dwSize as usize) as *const RECT;
-    (0..n).map(|i| Rect::from_win(&*rects.add(i))).collect()
-}
-
 /// Whether two text shapes have the same content, placement and look.
 fn same_text(a: &Shape, b: &Shape) -> bool {
     match (a, b) {
@@ -659,49 +405,33 @@ fn same_text(a: &Shape, b: &Shape) -> bool {
     }
 }
 
-impl Overlay {
-    fn new(main: HWND, gif_mode: bool, fonts: Arc<Fonts>) -> Option<Box<Overlay>> {
-        let vs = capture::virtual_screen();
-        let shot = capture::capture(vs)?;
-        Self::with_image(main, gif_mode, fonts, vs, shot)
-    }
-
-    fn with_image(main: HWND, gif_mode: bool, fonts: Arc<Fonts>, vs: Rect, shot: Vec<u8>) -> Option<Box<Overlay>> {
-        let back = Dib::new(vs.w(), vs.h())?;
+impl Editor {
+    pub fn new(host: Box<dyn Host>, screen: Screen, fonts: Arc<Fonts>, gif_mode: bool, scale: f32) -> Box<Editor> {
+        let Screen { w, h, pixels: shot, monitors, windows, mouse, origin } = screen;
         let mut dim = shot.clone();
         for p in dim.chunks_exact_mut(4) {
             p[0] >>= 1;
             p[1] >>= 1;
             p[2] >>= 1;
         }
-        let mut cur = POINT { x: 0, y: 0 };
-        unsafe { GetCursorPos(&mut cur) };
-        let bounds = Rect::new(0, 0, vs.w(), vs.h());
-        let monitors = enum_monitors().into_iter().map(|r| r.offset(-vs.l, -vs.t)).collect();
-        let windows = enum_windows()
-            .into_iter()
-            .map(|r| r.offset(-vs.l, -vs.t).intersect(&bounds))
-            .filter(|r| !r.is_empty())
-            .collect();
-        let mut ov = Box::new(Overlay {
-            hwnd: null_mut(),
-            main,
+        let mut ed = Box::new(Editor {
+            host,
             gif_mode,
-            ox: vs.l,
-            oy: vs.t,
-            w: vs.w(),
-            h: vs.h(),
+            ox: origin.0,
+            oy: origin.1,
+            w,
+            h,
             shot,
             dim,
-            back,
+            back: vec![0; w as usize * h as usize * 4],
             fonts,
-            scale: util::dpi_scale_at(cur.x, cur.y),
+            scale,
             monitors,
             windows,
             sel: None,
             drag: Drag::None,
             down: (0, 0),
-            mouse: ((cur.x - vs.l).clamp(0, vs.w() - 1), (cur.y - vs.t).clamp(0, vs.h() - 1)),
+            mouse: (mouse.0.clamp(0, w - 1), mouse.1.clamp(0, h - 1)),
             hover_win: None,
             hover_btn: None,
             tool: None,
@@ -712,7 +442,6 @@ impl Overlay {
             current: None,
             edit: None,
             caret_on: true,
-            high_surrogate: None,
             committed: Vec::new(),
             committed_ok: false,
             comp: Vec::new(),
@@ -721,10 +450,35 @@ impl Overlay {
             flash: None,
             last_parts: Vec::new(),
         });
-        ov.hover_win = ov.window_at(ov.mouse.0, ov.mouse.1);
-        ov.last_parts = ov.scene_parts();
-        Some(ov)
+        ed.hover_win = ed.window_at(ed.mouse.0, ed.mouse.1);
+        ed.last_parts = ed.scene_parts();
+        ed
     }
+
+    /// The composed frame (BGRA, `width` x `height`), valid for the
+    /// rectangles last passed to [`Editor::render`].
+    pub fn back(&self) -> &[u8] {
+        &self.back
+    }
+
+    pub fn size(&self) -> (i32, i32) {
+        (self.w, self.h)
+    }
+
+    pub fn color(&self) -> Rgba {
+        self.prefs.color
+    }
+
+    pub fn outline_custom(&self) -> Rgba {
+        self.prefs.outline_custom
+    }
+
+    /// Makes `c` the custom outline color and switches to it.
+    pub fn set_custom_outline(&mut self, c: Rgba) {
+        self.prefs.outline_custom = c;
+        self.set_outline(OutlineMode::Custom);
+    }
+
 
     // ----- geometry helpers -------------------------------------------------
 
@@ -994,10 +748,16 @@ impl Overlay {
         if self.sel.is_some() || !matches!(self.drag, Drag::None | Drag::Pending) {
             return None;
         }
-        let text = if self.gif_mode {
-            "Record GIF: drag to select an area, or click a window   ·   Esc to cancel"
-        } else {
-            "Drag to select an area, or click a window   ·   C copies the color under the cursor   ·   Esc to cancel"
+        // Without window positions (Wayland), a click selects the screen.
+        let text = match (self.gif_mode, self.windows.is_empty()) {
+            (true, false) => "Record GIF: drag to select an area, or click a window   ·   Esc to cancel",
+            (true, true) => "Record GIF: drag to select an area, or click for the whole screen   ·   Esc to cancel",
+            (false, false) => {
+                "Drag to select an area, or click a window   ·   C copies the color under the cursor   ·   Esc to cancel"
+            }
+            (false, true) => {
+                "Drag to select an area, or click for the whole screen   ·   C copies the color under the cursor   ·   Esc to cancel"
+            }
         };
         let (pw, ph) = self.label_rect(text, self.pxf(13.0));
         let (pw, ph) = (pw + self.px(10.0), ph + self.px(8.0));
@@ -1083,16 +843,14 @@ impl Overlay {
     /// which keeps hovering over a maximized window cheap.
     fn invalidate(&mut self) {
         let new = self.scene_parts();
-        if !self.hwnd.is_null() {
-            for part in new.iter().chain(self.last_parts.iter()) {
-                let is_static = matches!(part.0, Part::Hover | Part::Hint);
-                if is_static && new.contains(part) && self.last_parts.contains(part) {
-                    continue;
-                }
-                let r = part.1.intersect(&self.bounds());
-                if !r.is_empty() {
-                    unsafe { InvalidateRect(self.hwnd, &r.to_win(), FALSE) };
-                }
+        for part in new.iter().chain(self.last_parts.iter()) {
+            let is_static = matches!(part.0, Part::Hover | Part::Hint);
+            if is_static && new.contains(part) && self.last_parts.contains(part) {
+                continue;
+            }
+            let r = part.1.intersect(&self.bounds());
+            if !r.is_empty() {
+                self.host.invalidate(r);
             }
         }
         self.last_parts = new;
@@ -1165,49 +923,31 @@ impl Overlay {
     }
 
     /// Composes the scene into the back buffer for the given rectangles.
-    fn render(&mut self, rects: &[Rect]) {
+    pub fn render(&mut self, rects: &[Rect]) {
         let (w, h) = (self.w, self.h);
-        let back = unsafe { std::slice::from_raw_parts_mut(self.back.bits, w as usize * h as usize * 4) };
+        let mut back = std::mem::take(&mut self.back);
         for rc in rects {
             let rc = rc.intersect(&self.bounds());
             if rc.is_empty() {
                 continue;
             }
-            blit(&self.dim, w, 0, 0, back, w, rc);
+            blit(&self.dim, w, 0, 0, &mut back, w, rc);
             if let Some(sel) = self.sel {
                 self.ensure_comp();
                 let i = rc.intersect(&sel);
                 if !i.is_empty() {
-                    blit(&self.comp, sel.w(), sel.l, sel.t, back, w, i);
+                    blit(&self.comp, sel.w(), sel.l, sel.t, &mut back, w, i);
                 }
             } else if let Some(hw) = self.hover_rect() {
                 let i = rc.intersect(&hw);
                 if !i.is_empty() {
-                    blit(&self.shot, w, 0, 0, back, w, i);
+                    blit(&self.shot, w, 0, 0, &mut back, w, i);
                 }
             }
         }
-        let mut cv = Canvas::new(back, w, h);
+        let mut cv = Canvas::new(&mut back, w, h);
         self.draw_ui(&mut cv);
-    }
-
-    fn on_paint(&mut self) {
-        unsafe {
-            let rgn = CreateRectRgn(0, 0, 0, 0);
-            GetUpdateRgn(self.hwnd, rgn, FALSE);
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(self.hwnd, &mut ps);
-            let rects = region_rects(rgn, Rect::from_win(&ps.rcPaint));
-            DeleteObject(rgn);
-            self.render(&rects);
-            for r in rects {
-                let r = r.intersect(&self.bounds());
-                if !r.is_empty() {
-                    BitBlt(hdc, r.l, r.t, r.w(), r.h(), self.back.dc, r.l, r.t, SRCCOPY);
-                }
-            }
-            EndPaint(self.hwnd, &ps);
-        }
+        self.back = back;
     }
 
     // ----- UI drawing -------------------------------------------------------
@@ -1512,7 +1252,7 @@ impl Overlay {
         }
     }
 
-    fn set_color(&mut self, c: Rgba) {
+    pub fn set_color(&mut self, c: Rgba) {
         self.prefs.color = c;
         if let Some(e) = &mut self.edit {
             e.color = c;
@@ -1544,7 +1284,7 @@ impl Overlay {
             return;
         }
         if let Shape::Pixelate { a, b, block, seed, patch } = s {
-            unsafe { SetCursor(LoadCursorW(null_mut(), IDC_WAIT)) };
+            self.host.set_cursor(Cursor::Wait);
             *patch = annotate::make_patch(&self.shot, self.w, self.h, *a, *b, *block, *seed, &self.fonts);
         }
     }
@@ -1552,7 +1292,7 @@ impl Overlay {
     fn commit_edit(&mut self) {
         let outline = self.edit_outline();
         let Some(e) = self.edit.take() else { return };
-        unsafe { KillTimer(self.hwnd, TIMER_CARET) };
+        self.host.kill_timer(TIMER_CARET);
         let shape = Shape::Text { pos: e.pos, text: e.text, color: e.color, size: e.size, outline };
         match e.original {
             None => self.push_shape(shape),
@@ -1573,7 +1313,7 @@ impl Overlay {
 
     fn undo(&mut self) {
         if let Some(e) = self.edit.take() {
-            unsafe { KillTimer(self.hwnd, TIMER_CARET) };
+            self.host.kill_timer(TIMER_CARET);
             // Abandoning a re-edit puts the original text back.
             if e.original.is_some() {
                 if let Some(prev) = self.history.pop() {
@@ -1623,14 +1363,14 @@ impl Overlay {
     }
 
     /// Shows a short message next to the cursor.
-    fn show_flash(&mut self, msg: String) {
+    pub fn show_flash(&mut self, msg: String) {
         self.flash = Some(msg);
-        unsafe { SetTimer(self.hwnd, TIMER_FLASH, 1100, None) };
+        self.host.set_timer(TIMER_FLASH, 1100);
         self.invalidate();
     }
 
     /// The screenshot's color under the cursor, as `#RRGGBB`.
-    fn color_under_cursor(&self) -> String {
+    pub fn color_under_cursor(&self) -> String {
         let (x, y) = (self.mouse.0.clamp(0, self.w - 1), self.mouse.1.clamp(0, self.h - 1));
         let k = ((y * self.w + x) * 4) as usize;
         format!("#{:02X}{:02X}{:02X}", self.shot[k + 2], self.shot[k + 1], self.shot[k])
@@ -1669,7 +1409,7 @@ impl Overlay {
         self.caret_on = true;
         self.committed_ok = false;
         self.comp_ok = false;
-        unsafe { SetTimer(self.hwnd, TIMER_CARET, 530, None) };
+        self.host.set_timer(TIMER_CARET, 530);
     }
 
     fn start_text(&mut self, x: i32, y: i32) {
@@ -1684,7 +1424,7 @@ impl Overlay {
         });
         self.caret_on = true;
         self.comp_ok = false;
-        unsafe { SetTimer(self.hwnd, TIMER_CARET, 530, None) };
+        self.host.set_timer(TIMER_CARET, 530);
     }
 
     fn start_shape(&mut self, tool: Tool, x: i32, y: i32) {
@@ -1736,7 +1476,7 @@ impl Overlay {
         self.comp_ok = false;
     }
 
-    fn final_image(&mut self) -> Option<(i32, i32, Vec<u8>)> {
+    pub fn final_image(&mut self) -> Option<(i32, i32, Vec<u8>)> {
         self.commit_edit();
         self.current = None;
         let sel = self.sel?;
@@ -1744,7 +1484,7 @@ impl Overlay {
         Some((sel.w(), sel.h(), self.committed.clone()))
     }
 
-    fn gif_request(&mut self) -> Option<GifRequest> {
+    pub fn gif_request(&mut self) -> Option<GifRequest> {
         self.commit_edit();
         let sel = self.sel?;
         let mut shapes = self.shapes.clone();
@@ -1756,98 +1496,50 @@ impl Overlay {
 
     // ----- input ------------------------------------------------------------
 
-    fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> (Option<LRESULT>, Option<Action>) {
-        match msg {
-            WM_PAINT => {
-                self.on_paint();
-                (Some(0), None)
-            }
-            WM_ERASEBKGND => (Some(1), None),
-            WM_SETCURSOR => {
-                if (lp & 0xFFFF) as u32 == HTCLIENT {
-                    self.update_cursor();
-                    (Some(1), None)
-                } else {
-                    (None, None)
-                }
-            }
-            WM_MOUSEMOVE => {
-                let (x, y) = lparam_xy(lp);
-                self.on_move(x, y, wp & MK_SHIFT as usize != 0);
-                (Some(0), None)
-            }
-            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-                let (x, y) = lparam_xy(lp);
-                (Some(0), self.on_down(x, y, msg == WM_LBUTTONDBLCLK))
-            }
-            WM_LBUTTONUP => {
-                let (x, y) = lparam_xy(lp);
-                (Some(0), self.on_up(x, y))
-            }
-            WM_RBUTTONDOWN => (Some(0), self.on_right()),
-            WM_MOUSEWHEEL => {
-                self.on_wheel(((wp >> 16) & 0xFFFF) as i16 as i32);
-                (Some(0), None)
-            }
-            WM_KEYDOWN => (Some(0), self.on_key(wp as u16)),
-            WM_CHAR => {
-                self.on_char(wp as u16);
-                (Some(0), None)
-            }
-            WM_TIMER => {
-                self.on_timer(wp);
-                (Some(0), None)
-            }
-            // Spanning monitors with different DPIs must not resize us.
-            WM_DPICHANGED => (Some(0), None),
-            WM_CLOSE => (Some(0), Some(Action::Close)),
-            _ => (None, None),
-        }
-    }
-
-    fn update_cursor(&self) {
+    /// Sets the cursor for what's under the mouse.
+    pub fn update_cursor(&mut self) {
         let (x, y) = self.mouse;
         let handle_cursor = |h: Handle| match h {
-            Handle::N | Handle::S => IDC_SIZENS,
-            Handle::E | Handle::W => IDC_SIZEWE,
-            Handle::NW | Handle::SE => IDC_SIZENWSE,
-            Handle::NE | Handle::SW => IDC_SIZENESW,
+            Handle::N | Handle::S => Cursor::SizeNS,
+            Handle::E | Handle::W => Cursor::SizeWE,
+            Handle::NW | Handle::SE => Cursor::SizeNWSE,
+            Handle::NE | Handle::SW => Cursor::SizeNESW,
         };
         let id = match self.drag {
-            Drag::Move { .. } | Drag::MoveShape { .. } | Drag::MoveEdit { .. } => IDC_SIZEALL,
+            Drag::Move { .. } | Drag::MoveShape { .. } | Drag::MoveEdit { .. } => Cursor::Move,
             Drag::Resize { h, .. } => handle_cursor(h),
-            Drag::Draw | Drag::NewSel { .. } | Drag::Pending => IDC_CROSS,
-            Drag::Button(_) => IDC_HAND,
+            Drag::Draw | Drag::NewSel { .. } | Drag::Pending => Cursor::Cross,
+            Drag::Button(_) => Cursor::Hand,
             Drag::None => {
                 if self.hit_button(x, y).is_some() {
-                    IDC_HAND
+                    Cursor::Hand
                 } else if self.on_ui(x, y) {
-                    IDC_ARROW
+                    Cursor::Arrow
                 } else if let Some(sel) = self.sel {
                     if let Some(h) = self.hit_handle(x, y) {
                         handle_cursor(h)
                     } else if self.over_shape(x, y) {
-                        IDC_SIZEALL
+                        Cursor::Move
                     } else if let Some(t) = self.tool {
                         if t == Tool::Text {
-                            IDC_IBEAM
+                            Cursor::IBeam
                         } else {
-                            IDC_CROSS
+                            Cursor::Cross
                         }
                     } else if sel.contains(x, y) && !self.gif_mode {
-                        IDC_SIZEALL
+                        Cursor::Move
                     } else {
-                        IDC_CROSS
+                        Cursor::Cross
                     }
                 } else {
-                    IDC_CROSS
+                    Cursor::Cross
                 }
             }
         };
-        unsafe { SetCursor(LoadCursorW(null_mut(), id)) };
+        self.host.set_cursor(id);
     }
 
-    fn on_move(&mut self, x: i32, y: i32, shift: bool) {
+    pub fn on_move(&mut self, x: i32, y: i32, shift: bool) {
         let (x, y) = (x.clamp(0, self.w - 1), y.clamp(0, self.h - 1));
         self.mouse = (x, y);
         match self.drag {
@@ -1922,10 +1614,10 @@ impl Overlay {
         self.invalidate();
     }
 
-    fn on_down(&mut self, x: i32, y: i32, dbl: bool) -> Option<Action> {
+    pub fn on_down(&mut self, x: i32, y: i32, dbl: bool) -> Option<Action> {
         self.mouse = (x, y);
         self.down = (x, y);
-        unsafe { SetCapture(self.hwnd) };
+        self.host.capture_mouse(true);
 
         if dbl
             && self.tool.is_none()
@@ -1984,9 +1676,9 @@ impl Overlay {
         None
     }
 
-    fn on_up(&mut self, x: i32, y: i32) -> Option<Action> {
+    pub fn on_up(&mut self, x: i32, y: i32) -> Option<Action> {
         let (x, y) = (x.clamp(0, self.w - 1), y.clamp(0, self.h - 1));
-        unsafe { ReleaseCapture() };
+        self.host.capture_mouse(false);
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         let mut action = None;
         match drag {
@@ -2085,12 +1777,12 @@ impl Overlay {
 
     /// Right click steps back: cancel drawing → close palette → finish text →
     /// drop tool → drop selection → close.
-    fn on_right(&mut self) -> Option<Action> {
+    pub fn on_right(&mut self) -> Option<Action> {
         if matches!(self.drag, Drag::Draw) {
             self.current = None;
             self.drag = Drag::None;
             self.comp_ok = false;
-            unsafe { ReleaseCapture() };
+            self.host.capture_mouse(false);
         } else if !matches!(self.drag, Drag::None) {
             return None;
         } else if self.palette_open {
@@ -2110,7 +1802,7 @@ impl Overlay {
         None
     }
 
-    fn on_wheel(&mut self, delta: i32) {
+    pub fn on_wheel(&mut self, delta: i32) {
         let dir = delta.signum() as f32;
         if dir == 0.0 {
             return;
@@ -2136,14 +1828,14 @@ impl Overlay {
         self.invalidate();
     }
 
-    fn on_timer(&mut self, id: usize) {
+    pub fn on_timer(&mut self, id: usize) {
         match id {
             TIMER_CARET => {
                 self.caret_on = !self.caret_on;
                 self.comp_ok = false;
             }
             TIMER_FLASH => {
-                unsafe { KillTimer(self.hwnd, TIMER_FLASH) };
+                self.host.kill_timer(TIMER_FLASH);
                 self.flash = None;
             }
             _ => {}
@@ -2151,16 +1843,16 @@ impl Overlay {
         self.invalidate();
     }
 
-    fn on_key(&mut self, vk: u16) -> Option<Action> {
-        let ctrl = key_down(VK_CONTROL);
-        let shift = key_down(VK_SHIFT);
+    /// A key press: `vk` is a [`key`] code or an uppercase ASCII letter.
+    pub fn on_key(&mut self, vk: u16, mods: Mods) -> Option<Action> {
+        let Mods { ctrl, shift } = mods;
 
         if self.edit.is_some() {
             match vk {
-                VK_ESCAPE => self.commit_edit(),
-                VK_RETURN if ctrl => self.commit_edit(),
+                key::ESCAPE => self.commit_edit(),
+                key::ENTER if ctrl => self.commit_edit(),
                 _ if ctrl && vk == b'V' as u16 => {
-                    if let Some(t) = clipboard::get_text(self.hwnd) {
+                    if let Some(t) = self.host.clipboard_text() {
                         if let Some(e) = &mut self.edit {
                             e.text.push_str(&t.replace("\r\n", "\n").replace('\r', "\n"));
                             self.comp_ok = false;
@@ -2170,9 +1862,9 @@ impl Overlay {
                 _ if ctrl && vk == b'Z' as u16 => self.undo(),
                 _ if ctrl && (vk == b'C' as u16 || vk == b'S' as u16) => {
                     self.commit_edit();
-                    return self.on_key(vk);
+                    return self.on_key(vk, mods);
                 }
-                _ => return None, // typed characters arrive as WM_CHAR
+                _ => return None, // typed characters arrive through on_char
             }
             self.invalidate();
             return None;
@@ -2180,7 +1872,7 @@ impl Overlay {
 
         let mut action = None;
         match vk {
-            VK_ESCAPE => {
+            key::ESCAPE => {
                 if matches!(self.drag, Drag::Draw) {
                     return self.on_right();
                 } else if self.palette_open {
@@ -2189,14 +1881,14 @@ impl Overlay {
                     return Some(Action::Close);
                 }
             }
-            VK_RETURN if self.sel.is_some() => action = Some(Action::Copy),
-            VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => {
+            key::ENTER if self.sel.is_some() => action = Some(Action::Copy),
+            key::LEFT | key::RIGHT | key::UP | key::DOWN => {
                 if let (Some(s), Drag::None) = (self.sel, self.drag) {
                     let step = if shift { 10 } else { 1 };
                     let (dx, dy) = match vk {
-                        VK_LEFT => (-step, 0),
-                        VK_RIGHT => (step, 0),
-                        VK_UP => (0, -step),
+                        key::LEFT => (-step, 0),
+                        key::RIGHT => (step, 0),
+                        key::UP => (0, -step),
                         _ => (0, step),
                     };
                     let r = if ctrl {
@@ -2211,7 +1903,7 @@ impl Overlay {
                 }
             }
             // Delete removes the drawing under the cursor.
-            VK_DELETE | VK_BACK if matches!(self.drag, Drag::None) => {
+            key::DELETE | key::BACKSPACE if matches!(self.drag, Drag::None) => {
                 if let Some(i) = self.shape_under(self.mouse.0, self.mouse.1, false) {
                     self.snapshot();
                     self.shapes.remove(i);
@@ -2252,26 +1944,16 @@ impl Overlay {
         action
     }
 
-    fn on_char(&mut self, c: u16) {
+    /// A typed character for the text being edited (Enter as `'\r'`,
+    /// Backspace as `'\u{8}'`).
+    pub fn on_char(&mut self, ch: char) {
         let Some(e) = &mut self.edit else { return };
-        if (0xD800..0xDC00).contains(&c) {
-            self.high_surrogate = Some(c);
-            return;
-        }
-        let ch = if (0xDC00..0xE000).contains(&c) {
-            match self.high_surrogate.take() {
-                Some(hi) => char::decode_utf16([hi, c]).next().and_then(|r| r.ok()),
-                None => None,
-            }
-        } else {
-            char::from_u32(c as u32)
-        };
         match ch {
-            Some('\r') => e.text.push('\n'),
-            Some('\u{8}') => {
+            '\r' | '\n' => e.text.push('\n'),
+            '\u{8}' => {
                 e.text.pop();
             }
-            Some(ch) if !ch.is_control() => e.text.push(ch),
+            ch if !ch.is_control() => e.text.push(ch),
             _ => return,
         }
         self.caret_on = true;
@@ -2285,13 +1967,9 @@ impl Overlay {
 #[cfg(debug_assertions)]
 pub fn text_editing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     let (w, h) = (800, 500);
-    let vs = Rect::new(0, 0, w, h);
-    let mut ov = Overlay::with_image(null_mut(), false, fonts, vs, vec![255u8; (w * h * 4) as usize])
-        .ok_or("overlay init failed")?;
-    ov.monitors = vec![vs];
-    ov.windows.clear();
+    let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, vec![255u8; (w * h * 4) as usize]), fonts, false, 1.0);
     ov.sel = Some(Rect::new(50, 50, 750, 450));
-    let text = |ov: &Overlay| match ov.shapes.first() {
+    let text = |ov: &Editor| match ov.shapes.first() {
         Some(Shape::Text { pos, text, .. }) => Ok((*pos, text.clone())),
         other => Err(format!("expected one text shape, found {other:?}")),
     };
@@ -2301,7 +1979,7 @@ pub fn text_editing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     ov.tool = Some(Tool::Text);
     ov.on_down(200, 200, false);
     ov.on_up(200, 200);
-    "Hello".encode_utf16().for_each(|c| ov.on_char(c));
+    "Hello".chars().for_each(|c| ov.on_char(c));
     ov.activate(Btn::Tool(Tool::Text));
     let (p0, _) = text(&ov)?;
 
@@ -2327,7 +2005,7 @@ pub fn text_editing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     ov.on_down(gx + 100, gy + 50, false);
     ov.on_up(gx + 100, gy + 50);
     check(ov.edit.is_some() && ov.shapes.is_empty(), "clicking the text didn't open it for editing")?;
-    ov.on_char('!' as u16);
+    ov.on_char('!');
     ov.on_down(gx + 100, gy + 50, false);
     ov.on_move(gx + 130, gy + 70, false);
     ov.on_up(gx + 130, gy + 70);
@@ -2340,7 +2018,7 @@ pub fn text_editing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     // Abandoning a re-edit (Ctrl+Z while typing) keeps the original.
     ov.on_down(gx + 100, gy + 50, false);
     ov.on_up(gx + 100, gy + 50);
-    ov.on_char('X' as u16);
+    ov.on_char('X');
     ov.undo();
     check(ov.edit.is_none() && text(&ov)? == (p1, "Hello".into()), "abandoned re-edit lost the text")?;
     Ok("type, drag, undo/redo, click to edit, drag while editing, abandon edit".into())
@@ -2351,16 +2029,13 @@ pub fn text_editing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
 #[cfg(debug_assertions)]
 pub fn drawing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     let (w, h) = (800, 500);
-    let vs = Rect::new(0, 0, w, h);
     let mut shot = vec![255u8; (w * h * 4) as usize];
     let k = ((400 * w + 700) * 4) as usize;
     shot[k..k + 4].copy_from_slice(&[0xFF, 0x90, 0x1E, 255]); // #1E90FF at (700, 400)
-    let mut ov = Overlay::with_image(null_mut(), false, fonts, vs, shot).ok_or("overlay init failed")?;
-    ov.monitors = vec![vs];
-    ov.windows.clear();
+    let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, shot), fonts, false, 1.0);
     ov.sel = Some(Rect::new(50, 50, 750, 450));
     let check = |ok: bool, what: &str| if ok { Ok(()) } else { Err(what.to_string()) };
-    let steps = |ov: &Overlay| -> Vec<(u32, Pt)> {
+    let steps = |ov: &Editor| -> Vec<(u32, Pt)> {
         ov.shapes
             .iter()
             .filter_map(|s| match s {
@@ -2369,7 +2044,7 @@ pub fn drawing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
             })
             .collect()
     };
-    let draw = |ov: &mut Overlay, tool: Tool, a: (i32, i32), b: (i32, i32)| {
+    let draw = |ov: &mut Editor, tool: Tool, a: (i32, i32), b: (i32, i32)| {
         ov.tool = Some(tool);
         ov.on_down(a.0, a.1, false);
         ov.on_move(b.0, b.1, false);
@@ -2416,25 +2091,23 @@ pub fn drawing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     // Delete removes the drawing under the cursor; undo brings it back.
     let count = ov.shapes.len();
     ov.mouse = (150, 340);
-    ov.on_key(VK_DELETE);
-    let arrows = |ov: &Overlay| ov.shapes.iter().filter(|s| matches!(s, Shape::Arrow { .. })).count();
+    ov.on_key(key::DELETE, Mods::default());
+    let arrows = |ov: &Editor| ov.shapes.iter().filter(|s| matches!(s, Shape::Arrow { .. })).count();
     check(ov.shapes.len() == count - 1 && arrows(&ov) == 0, "Delete didn't remove the arrow under the cursor")?;
     ov.undo();
     check(ov.shapes.len() == count && arrows(&ov) == 1, "undo didn't restore the deleted arrow")?;
 
     // C copies the screen color under the cursor.
     ov.mouse = (700, 400);
-    check(matches!(ov.on_key(b'C' as u16), Some(Action::CopyColor)), "C didn't ask to copy the color")?;
+    check(matches!(ov.on_key(b'C' as u16, Mods::default()), Some(Action::CopyColor)), "C didn't ask to copy the color")?;
     check(ov.color_under_cursor() == "#1E90FF", "wrong color under the cursor")?;
     Ok("steps 1-2-3, drag while placing, move arrow/rect, delete + undo, color #1E90FF".into())
 }
 
 /// Renders the overlay into a PNG without showing a window (debug self-test).
 #[cfg(debug_assertions)]
-pub fn render_preview(fonts: Arc<Fonts>, out: &std::path::Path) -> Result<(), String> {
-    let vs = capture::virtual_screen();
-    let shot = capture::capture(vs).ok_or("capture failed")?;
-    let mut ov = Overlay::with_image(null_mut(), false, fonts, vs, shot).ok_or("overlay init failed")?;
+pub fn render_preview(fonts: Arc<Fonts>, screen: Screen, out: &std::path::Path) -> Result<(), String> {
+    let mut ov = Editor::new(Box::new(NullHost), screen, fonts, false, 1.0);
     let mon = ov.monitors.first().copied().unwrap_or(ov.bounds());
     let sel = Rect::xywh(mon.l + mon.w() / 4, mon.t + mon.h() / 4, mon.w() / 2, mon.h() / 2);
     ov.sel = Some(sel);
@@ -2470,7 +2143,35 @@ pub fn render_preview(fonts: Arc<Fonts>, out: &std::path::Path) -> Result<(), St
     }
     let all = ov.bounds();
     ov.render(&[all]);
-    let px = unsafe { std::slice::from_raw_parts(ov.back.bits, ov.back.len()) }.to_vec();
-    let png = capture::encode_png(ov.w, ov.h, &px)?;
+    let png = crate::util::encode_png(ov.w, ov.h, &ov.back)?;
     std::fs::write(out, png).map_err(|e| e.to_string())
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        // Color, sizes and outline carry over to the next capture.
+        PREFS.with(|c| c.set(self.prefs));
+    }
+}
+
+/// A host that does nothing (self-tests).
+#[cfg(debug_assertions)]
+struct NullHost;
+
+#[cfg(debug_assertions)]
+impl Host for NullHost {
+    fn invalidate(&mut self, _: Rect) {}
+    fn set_cursor(&mut self, _: Cursor) {}
+    fn set_timer(&mut self, _: usize, _: u32) {}
+    fn kill_timer(&mut self, _: usize) {}
+    fn capture_mouse(&mut self, _: bool) {}
+    fn clipboard_text(&mut self) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_screen(w: i32, h: i32, pixels: Vec<u8>) -> Screen {
+    let r = Rect::new(0, 0, w, h);
+    Screen { w, h, pixels, monitors: vec![r], windows: Vec::new(), mouse: (0, 0), origin: (0, 0) }
 }

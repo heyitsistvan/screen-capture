@@ -13,7 +13,6 @@ use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, Gl
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
 use windows_sys::Win32::UI::Shell::DROPFILES;
 
-use crate::capture;
 use crate::util::wide;
 
 /// Puts an opaque BGRA image on the clipboard as both CF_DIB and PNG.
@@ -48,7 +47,7 @@ pub fn set_image(hwnd: HWND, w: i32, h: i32, bgra: &[u8]) -> bool {
     }
 
     let mut items = vec![(CF_DIB as u32, dib)];
-    if let Ok(png) = capture::encode_png(w, h, bgra) {
+    if let Ok(png) = crate::util::encode_png(w, h, bgra) {
         items.push((register("PNG"), png));
     }
     set(hwnd, items)

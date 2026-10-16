@@ -26,25 +26,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::annotate::{self, Rgba, Shape};
-use crate::capture::{Dib, Grabber};
+use crate::annotate;
+use super::capture::{Dib, Grabber};
+use crate::editor::GifRequest;
 use crate::gif_enc::{self, GifInfo, Msg};
-use crate::text::{self, Fonts};
-use crate::ui::{Canvas, Icon};
+use crate::recbar::{self, BarBtn, BarState};
+use crate::text::Fonts;
+use crate::ui::Canvas;
 use crate::util::{self, wide, Rect};
-use crate::{WM_APP_CANCEL_GIF, WM_APP_GIF_DONE, WM_APP_STOP_GIF};
+use super::{WM_APP_CANCEL_GIF, WM_APP_GIF_DONE, WM_APP_STOP_GIF};
 
 const BORDER_CLASS: &str = "ScreenCaptureRecBorder";
 const BAR_CLASS: &str = "ScreenCaptureRecBar";
-const RED: Rgba = Rgba(229, 57, 53, 255);
 
-/// What the overlay hands over when the user starts a recording.
-pub struct GifRequest {
-    /// Area to record, in screen coordinates.
-    pub region: Rect,
-    /// Annotations to burn into every frame, relative to the region.
-    pub shapes: Vec<Shape>,
-}
 
 /// Posted to the main window (boxed, in LPARAM) when encoding ends.
 pub struct GifOutcome {
@@ -243,12 +237,6 @@ unsafe fn create_borders(r: Rect, th: i32) -> Vec<HWND> {
     .collect()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BarBtn {
-    Stop,
-    Cancel,
-}
-
 struct Bar {
     main: HWND,
     shared: Arc<Shared>,
@@ -263,7 +251,7 @@ struct Bar {
 
 unsafe fn create_bar(main: HWND, r: Rect, th: i32, scale: f32, shared: Arc<Shared>, fonts: Arc<Fonts>) -> HWND {
     let px = |v: f32| (v * scale).round() as i32;
-    let (bw, bh) = (px(260.0), px(40.0));
+    let (bw, bh) = recbar::size(scale, &fonts);
     let (cx, cy) = r.center();
     let mon = util::monitor_rect_at(cx, cy);
     let gap = th + px(6.0);
@@ -315,93 +303,29 @@ unsafe fn create_bar(main: HWND, r: Rect, th: i32, scale: f32, shared: Arc<Share
 }
 
 impl Bar {
-    fn px(&self, v: f32) -> i32 {
-        (v * self.scale).round() as i32
-    }
-
     fn encoding(&self) -> bool {
         self.shared.stop.load(Relaxed)
     }
 
-    fn buttons(&self) -> Vec<(BarBtn, Rect)> {
-        let b = self.px(28.0);
-        let pad = (self.h - b) / 2;
-        let cancel = Rect::xywh(self.w - pad - b, pad, b, b);
-        if self.encoding() {
-            vec![(BarBtn::Cancel, cancel)]
-        } else {
-            let sw = self.px(72.0);
-            vec![(BarBtn::Stop, Rect::xywh(cancel.l - self.px(6.0) - sw, pad, sw, b)), (BarBtn::Cancel, cancel)]
-        }
-    }
-
     fn hit(&self, x: i32, y: i32) -> Option<BarBtn> {
-        self.buttons().into_iter().find(|(_, r)| r.contains(x, y)).map(|(b, _)| b)
+        recbar::hit(self.w, self.h, self.scale, self.encoding(), x, y)
     }
 
     fn paint(&mut self, hdc: HDC) {
         if self.dib.is_none() {
             self.dib = Dib::new(self.w, self.h);
         }
-        let buttons = self.buttons();
-        let encoding = self.encoding();
-        let (w, h, s) = (self.w, self.h, self.scale);
+        let state = BarState {
+            encoding: self.encoding(),
+            elapsed_ms: self.shared.start.elapsed().as_millis() as u64,
+            frames: self.shared.frames.load(Relaxed),
+            processed: self.shared.processed.load(Relaxed),
+        };
+        let (w, h, scale, hover) = (self.w, self.h, self.scale, self.hover);
         let fonts = self.fonts.clone();
-        let hover = self.hover;
-        let frames = self.shared.frames.load(Relaxed);
-        let processed = self.shared.processed.load(Relaxed);
-        let ms = self.shared.start.elapsed().as_millis() as u64;
         let Some(dib) = self.dib.as_mut() else { return };
         let dc = dib.dc;
-        let mut cv = Canvas::new(dib.bytes_mut(), w, h);
-
-        cv.fill_px(Rect::new(0, 0, w, h), Rgba(28, 29, 32, 255));
-        let fpx = 13.0 * s;
-        let (_, lh) = text::line_metrics(&fonts.ui, fpx);
-        let cy = h as f32 / 2.0;
-        let ty = cy - lh / 2.0;
-        let mut x = 14.0 * s;
-        if !encoding {
-            let on = (ms / 500) % 2 == 0;
-            cv.fill_circle(x + 5.0 * s, cy, 5.0 * s, if on { RED } else { RED.alpha(70) });
-            x += 18.0 * s;
-            let secs = ms / 1000;
-            let label = format!("REC {:02}:{:02}", secs / 60, secs % 60);
-            cv.text(x, ty, &label, fpx, Rgba(255, 255, 255, 255), &fonts.bold);
-            x += text::line_width(&fonts.bold, &label, fpx) + 10.0 * s;
-            let small = 12.0 * s;
-            let (_, slh) = text::line_metrics(&fonts.ui, small);
-            cv.text(x, cy - slh / 2.0, &format!("{frames} frames"), small, Rgba(150, 152, 158, 255), &fonts.ui);
-        } else {
-            let total = frames.max(1);
-            let pct = processed.min(total) * 100 / total;
-            cv.text(x, ty, &format!("Encoding GIF…  {pct}%"), fpx, Rgba(255, 255, 255, 255), &fonts.ui);
-            let px = |v: f32| (v * s).round() as i32;
-            let track = Rect::new(px(14.0), h - px(6.0), w - px(54.0), h - px(3.0));
-            cv.fill_rrect(track, 1.5 * s, Rgba(255, 255, 255, 35));
-            let fill = Rect::new(track.l, track.t, track.l + (track.w() as usize * pct / 100) as i32, track.b);
-            cv.fill_rrect(fill, 1.5 * s, Rgba(10, 132, 255, 255));
-        }
-
-        for (b, r) in buttons {
-            let hovered = hover == Some(b);
-            match b {
-                BarBtn::Stop => {
-                    cv.fill_rrect(r, 6.0 * s, if hovered { Rgba(244, 81, 72, 255) } else { RED });
-                    let ic = r.l as f32 + 16.0 * s;
-                    let mid = (r.t + r.b) as f32 / 2.0;
-                    cv.icon(Icon::Stop, ic, mid, 16.0 * s, Rgba(255, 255, 255, 255), &fonts);
-                    cv.text(ic + 11.0 * s, mid - lh / 2.0, "Stop", fpx, Rgba(255, 255, 255, 255), &fonts.bold);
-                }
-                BarBtn::Cancel => {
-                    if hovered {
-                        cv.fill_rrect(r, 6.0 * s, Rgba(255, 255, 255, 30));
-                    }
-                    let (cx, cy) = ((r.l + r.r) as f32 / 2.0, (r.t + r.b) as f32 / 2.0);
-                    cv.icon(Icon::Close, cx, cy, 16.0 * s, Rgba(200, 202, 208, 255), &fonts);
-                }
-            }
-        }
+        recbar::draw(&mut Canvas::new(dib.bytes_mut(), w, h), scale, &state, hover, &fonts);
         unsafe { BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY) };
     }
 }

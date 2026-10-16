@@ -1,19 +1,40 @@
 # Screen Capture
 
-A Lightshot-style screenshot tool for Windows, written in Rust. Press **PrtSc**, select an
-area, draw on it, copy it. Press **Shift+PrtSc** to record the area as an animated GIF.
+A Lightshot-style screenshot tool for Windows and Linux, written in Rust. Press **PrtSc**,
+select an area, draw on it, copy it. Press **Shift+PrtSc** to record the area as an animated
+GIF.
 
-Single ~1 MB executable, no runtime dependencies. Lives in the notification area.
+A single executable (about 1 MB on Windows) that lives in the notification area / system tray.
 
 ## Build
 
 ```sh
 cargo build --release
-# -> target/release/screen-capture.exe
+# Windows: target/release/screen-capture.exe
+# Linux:   target/release/screen-capture
 ```
 
-Requires the MSVC Rust toolchain (`x86_64-pc-windows-msvc`) and the Windows SDK (installed with
-Visual Studio Build Tools), which is used to embed the icon and DPI manifest.
+**Windows**: requires the MSVC Rust toolchain (`x86_64-pc-windows-msvc`) and the Windows SDK
+(installed with Visual Studio Build Tools), which is used to embed the icon and DPI manifest. No
+runtime dependencies.
+
+**Linux**: needs a C toolchain, clang (for the PipeWire bindings) and the PipeWire headers:
+
+| Distribution | Packages |
+|---|---|
+| Debian / Ubuntu | `build-essential pkg-config clang libpipewire-0.3-dev` |
+| Fedora | `gcc pkgconf clang-devel pipewire-devel` |
+| Arch | `base-devel clang pipewire` |
+
+At runtime it needs `libpipewire-0.3` (present on any current desktop). Optional extras:
+
+- `tesseract` (packages `tesseract-ocr` / `tesseract`): makes pixelate safe for text (see
+  below). Without it, pixelate falls back to a color mosaic.
+- `zenity` (or `kdialog` on KDE): the Save dialog and the custom color picker. Without them,
+  Ctrl+S saves straight to `~/Pictures/Screen Capture/`.
+- A tray that supports StatusNotifierItem: KDE, XFCE, Cinnamon, sway/waybar and most others
+  do; GNOME needs the "AppIndicator and KStatusNotifierItem Support" extension. Without a tray,
+  use PrtSc and the command line below.
 
 ## Use
 
@@ -24,7 +45,7 @@ Visual Studio Build Tools), which is used to embed the icon and DPI manifest.
 | **PrtSc** while recording | Stop and save the GIF |
 | Tray icon click | Capture; right-click for the menu |
 
-Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep working.
+On Windows, Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep working.
 
 ### In the overlay
 
@@ -53,12 +74,13 @@ Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep working.
   works with no tool selected or with the Text tool.
 - **Pixelate** works on anything and is safe for passwords and keys. Plain pixelated text can be
   read back by rendering guesses in the same font and comparing (tools like Depix do this). So
-  before pixelating, the OCR engine built into Windows finds the words, and they're replaced with
-  random fake words of the same size, color and roughly the same width. Images are pixelated
-  normally, and text looks like pixelated text, just not the real text. What still shows is
-  where words are and roughly how long, as with any redaction box. Text the OCR misses gets
-  ordinary pixelation; if OCR isn't available at all, the area becomes a mosaic of its colors
-  instead. The result is frozen when you draw it, so in GIFs nothing typed behind it shows.
+  before pixelating, OCR finds the words (the engine built into Windows; Tesseract on Linux),
+  and they're replaced with random fake words of the same size, color and roughly the same
+  width. Images are pixelated normally, and text looks like pixelated text, just not the real
+  text. What still shows is where words are and roughly how long, as with any redaction box.
+  Text the OCR misses gets ordinary pixelation; if OCR isn't available at all, the area becomes
+  a mosaic of its colors instead. The result is frozen when you draw it, so in GIFs nothing
+  typed behind it shows.
 - **Ctrl+C**, **Enter** or **double-click** copies the image to the clipboard and closes.
   **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** records the selection as a GIF.
   **Esc** closes. **Right-click** steps back (cancels tool, then selection, then closes).
@@ -70,9 +92,9 @@ Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep working.
 - A red frame marks the recorded area. The floating bar shows the time and has **Stop** and
   **discard** buttons (drag it by its background if it's in the way). It's excluded from the
   recording.
-- GIFs are saved to `Pictures\Screen Capture\` and put on the clipboard as a file, so they paste
-  (still animated) into Explorer, Slack, Discord, Teams, e-mail and so on. Click the notification
-  to show the file.
+- GIFs are saved to `Pictures\Screen Capture\` (`~/Pictures/Screen Capture/` on Linux) and put on
+  the clipboard as a file, so they paste (still animated) into a file manager, Slack, Discord,
+  Teams, e-mail and so on. Click the notification to show the file.
 - Frame rate (10–30 fps) and whether the mouse cursor is recorded are in the tray menu.
 - Encoding: unchanged frames are merged, and each frame stores only the changed rectangle,
   with unchanged pixels transparent. Each frame gets its own palette, and quantization runs in
@@ -80,30 +102,73 @@ Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep working.
 
 ### Tray menu
 
-Capture, Record GIF, GIF frame rate, cursor in GIFs, open the GIF folder, **Start with Windows**
-(registers the exe's current path; move the exe to its final location first), Exit.
+Capture, Record GIF, GIF frame rate, cursor in GIFs, open the GIF folder, **Start with Windows** /
+**Start at login** (registers the executable's current path; move it to its final location
+first), Exit.
 
-Command line: `screen-capture.exe --capture` or `--gif` triggers a capture in the running
-instance (handy for binding to another key or a shortcut).
+Command line: `screen-capture --capture` or `--gif` triggers a capture in the running instance
+(handy for binding to another key or a shortcut). Like PrtSc, `--capture` during a recording
+stops it; on Linux, `--stop` does only that.
 
-Settings: `%APPDATA%\screen-capture\settings.ini`.
+Settings: `%APPDATA%\screen-capture\settings.ini` on Windows,
+`~/.config/screen-capture/settings.ini` on Linux.
+
+## Linux notes
+
+Everything above works the same on X11 and Wayland, with these differences.
+
+**X11**: PrtSc is grabbed directly. Many desktops already bind PrtSc to their own screenshot tool
+(GNOME, KDE, XFCE, Cinnamon, openbox's default config…); then the app says so on startup, and you
+can free the key or bind another one in the desktop's keyboard settings to
+`screen-capture --capture` (and Shift+PrtSc to `screen-capture --gif`).
+
+**Wayland** doesn't let apps read the screen or grab keys directly, so the app goes through the
+desktop portals (`xdg-desktop-portal` plus your desktop's backend):
+
+- **Screenshots** use the Screenshot portal. GNOME asks once whether to allow it.
+- **PrtSc** is registered through the GlobalShortcuts portal where the desktop has one (KDE
+  Plasma 5.27+, GNOME 48+); the desktop may ask you to confirm or pick the key. Elsewhere (sway,
+  Hyprland, …), the app explains this once on startup; bind the keys in your compositor config,
+  e.g. for sway:
+
+  ```
+  bindsym Print exec screen-capture --capture
+  bindsym Shift+Print exec screen-capture --gif
+  ```
+
+- **GIF recording** uses the ScreenCast portal and PipeWire. The first recording asks which
+  screen to share; the choice is remembered.
+- Wayland doesn't tell apps where windows are, so **a click selects the whole screen** instead of
+  a window. The overlay covers one monitor (the primary one), and the recording bar is placed by
+  the compositor (drag it aside if needed); there's no red frame around the recorded area.
+- wlroots compositors (sway, Hyprland, river, …) need `xdg-desktop-portal-wlr` (or
+  `xdg-desktop-portal-hyprland`) **and** `xdg-desktop-portal-gtk`: the Screenshot portal only
+  works when a backend for its permission dialog is installed too.
 
 ## Development
 
 Debug builds include a non-interactive self-test that captures the screen, renders the overlay
-offscreen, encodes and re-decodes GIFs, and writes the results to a folder:
+offscreen, checks text editing, drawing, outlines and pixelate (including an attack that tries to
+read pixelated passwords back), encodes and re-decodes GIFs, and writes the results to a folder:
 
 ```sh
-cargo run -- --selftest out
+cargo run -- --selftest out [photo-tests-dir]
 ```
+
+The optional folder holds `photo_*.png` images with a photo in the left 320 px and text on the
+right, to check that pixelate scrambles the text and leaves the photo alone.
+
+Linux debug builds also have `--dump-screen <file.png>` (save the X screen), `--portal-test <dir>`
+(portal screenshot plus a 3-second screen-cast recording) and
+`--pipewire-test <dir> <node> <w> <h>` (record from any PipeWire video node).
 
 | Module | Purpose |
 |---|---|
-| `main.rs` | Tray app, PrtSc keyboard hook (own thread), recording lifecycle |
-| `overlay.rs` | Selection/annotation overlay, toolbars, magnifier, window snapping |
-| `annotate.rs` | Shapes and their rasterization (tiny-skia) |
-| `gif_rec.rs` | Recording session: capture thread, border, control bar |
+| `editor.rs` | The overlay: selection, toolbars, magnifier, annotation editing; platform-neutral |
+| `annotate.rs` | Shapes and their rasterization (tiny-skia), safe pixelate |
+| `ocr.rs` | Shared OCR preparation and word/line merging for pixelate |
 | `gif_enc.rs` | GIF encoder (frame diffing, quantization, parallel LZW) |
-| `capture.rs` | GDI screen capture, PNG encoding |
-| `clipboard.rs` | CF_DIB + PNG images, CF_HDROP files |
+| `recbar.rs` | The recording bar, drawn the same on both platforms |
 | `text.rs`, `ui.rs`, `icon.rs` | Font rendering, UI drawing and icons, app icon |
+| `win/` | Windows: tray, PrtSc keyboard hook, overlay window, GDI capture, clipboard, WinRT OCR, recording |
+| `linux/` | Linux: tray (StatusNotifierItem), X11 key grab and capture, portals, PipeWire recording, Tesseract OCR, dialogs |

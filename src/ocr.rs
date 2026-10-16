@@ -1,15 +1,13 @@
-//! Finds words with the OCR engine built into Windows (Windows.Media.Ocr).
-//! Only word positions are used: pixelate replaces the text with random fake
-//! words before pixelating, so the result can't be reversed.
-
-use windows::core::HSTRING;
-use windows::Globalization::Language;
-use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
-use windows::Media::Ocr::OcrEngine;
-use windows::Storage::Streams::DataWriter;
-use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+//! Finding words on screen, so pixelate can replace them with fake ones before
+//! pixelating. The recognizer is the OCR engine built into Windows, or
+//! Tesseract on Linux; only word positions are used.
 
 use crate::util::Rect;
+
+#[cfg(target_os = "linux")]
+use crate::linux::ocr as backend;
+#[cfg(windows)]
+use crate::win::ocr as backend;
 
 /// A line of text: its word boxes.
 #[derive(Debug, Default)]
@@ -23,67 +21,36 @@ impl Line {
     }
 }
 
-/// Lines of text in a BGRA image, or `None` if OCR isn't available.
-///
-/// To catch as much text as possible, detection runs on the image enlarged
-/// (small UI text is found more reliably) and again with colors inverted
-/// (light text on dark backgrounds), and overlapping results are merged.
+/// Lines of text in a BGRA image, or `None` if no OCR engine is available.
 pub fn find_text(bgra: &[u8], w: i32, h: i32) -> Option<Vec<Line>> {
-    let data = bgra.to_vec();
-    // WinRT needs a multithreaded apartment; the UI thread must stay
-    // single-threaded for the common dialogs, so run on a short-lived thread.
-    std::thread::spawn(move || unsafe {
-        let init = RoInitialize(RO_INIT_MULTITHREADED).is_ok();
-        let result = detect(&data, w, h).ok();
-        if init {
-            RoUninitialize();
+    let found = backend::recognize(bgra, w, h)?;
+    let mut lines: Vec<Line> = Vec::new();
+    for words in found {
+        let mut line = Line::default();
+        for r in words {
+            add_word(&mut line.words, r);
         }
-        result
-    })
-    .join()
-    .ok()
-    .flatten()
+        add_line(&mut lines, line);
+    }
+    Some(lines)
 }
 
-fn engine() -> windows::core::Result<OcrEngine> {
-    OcrEngine::TryCreateFromUserProfileLanguages()
-        .or_else(|_| OcrEngine::TryCreateFromLanguage(&Language::CreateLanguage(&HSTRING::from("en-US"))?))
-}
-
-fn detect(bgra: &[u8], w: i32, h: i32) -> windows::core::Result<Vec<Line>> {
-    let engine = engine()?;
-    let max = OcrEngine::MaxImageDimension()? as i32;
+/// The images to run OCR on, to catch as much text as possible: enlarged 2x
+/// when that fits under `max` (small UI text is found more reliably), once
+/// as-is and once inverted (light text on dark backgrounds). Returns the
+/// scale and the two passes, or `None` if the image is too large.
+pub(crate) fn passes(bgra: &[u8], w: i32, h: i32, max: i32) -> Option<(i32, [Vec<u8>; 2])> {
     let scale = if w.max(h) * 2 <= max { 2 } else { 1 };
     if w.max(h) * scale > max {
-        return Err(windows::core::Error::empty());
+        return None;
     }
+    Some((scale, [prepare(bgra, w, h, scale, false), prepare(bgra, w, h, scale, true)]))
+}
+
+/// A box found in a pass image, back in original image coordinates.
+pub(crate) fn unscale(x: f32, y: f32, w: f32, h: f32, scale: i32) -> Rect {
     let s = scale as f32;
-    let mut lines: Vec<Line> = Vec::new();
-    for invert in [false, true] {
-        let img = prepare(bgra, w, h, scale, invert);
-        let writer = DataWriter::new()?;
-        writer.WriteBytes(&img)?;
-        let bitmap =
-            SoftwareBitmap::CreateCopyFromBuffer(&writer.DetachBuffer()?, BitmapPixelFormat::Bgra8, w * scale, h * scale)?;
-        let result = engine.RecognizeAsync(&bitmap)?.get()?;
-        for line in result.Lines()? {
-            let mut found = Line::default();
-            for word in line.Words()? {
-                let r = word.BoundingRect()?;
-                add_word(
-                    &mut found.words,
-                    Rect::new(
-                        (r.X / s).floor() as i32,
-                        (r.Y / s).floor() as i32,
-                        ((r.X + r.Width) / s).ceil() as i32,
-                        ((r.Y + r.Height) / s).ceil() as i32,
-                    ),
-                );
-            }
-            add_line(&mut lines, found);
-        }
-    }
-    Ok(lines)
+    Rect::new((x / s).floor() as i32, (y / s).floor() as i32, ((x + w) / s).ceil() as i32, ((y + h) / s).ceil() as i32)
 }
 
 fn mostly_overlap(a: &Rect, b: &Rect) -> bool {
@@ -91,13 +58,18 @@ fn mostly_overlap(a: &Rect, b: &Rect) -> bool {
 }
 
 /// Adds a word box, merging it with one it mostly overlaps (the same word
-/// found in both passes).
+/// found in both passes). The merged box spans both horizontally, so no
+/// letters are left out, but takes the shorter one's height: a pass that
+/// barely made the word out can report a box reaching into the next line.
 fn add_word(words: &mut Vec<Rect>, r: Rect) {
     if r.is_empty() {
         return;
     }
     match words.iter_mut().find(|w| mostly_overlap(w, &r)) {
-        Some(w) => *w = w.union(&r),
+        Some(w) => {
+            let tight = if r.b - r.t < w.b - w.t { r } else { *w };
+            *w = Rect::new(w.l.min(r.l), tight.t, w.r.max(r.r), tight.b);
+        }
         None => words.push(r),
     }
 }

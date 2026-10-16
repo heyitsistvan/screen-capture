@@ -1,4 +1,4 @@
-//! Screen capture through GDI, plus PNG encoding of captured pixels.
+//! Screen capture through GDI.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -157,22 +157,4 @@ unsafe fn draw_cursor(dc: HDC, ox: i32, oy: i32) {
     if !ii.hbmColor.is_null() {
         DeleteObject(ii.hbmColor);
     }
-}
-
-/// Encodes opaque BGRA pixels as an RGB PNG.
-pub fn encode_png(w: i32, h: i32, bgra: &[u8]) -> Result<Vec<u8>, String> {
-    let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
-    for c in bgra.chunks_exact(4) {
-        rgb.extend_from_slice(&[c[2], c[1], c[0]]);
-    }
-    let mut out = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
-        enc.set_color(png::ColorType::Rgb);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.set_compression(png::Compression::Fast);
-        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
-        wr.write_image_data(&rgb).map_err(|e| e.to_string())?;
-    }
-    Ok(out)
 }

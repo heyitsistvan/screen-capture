@@ -2,7 +2,7 @@
 name = "screen-capture"
 version = "0.1.0"
 edition = "2021"
-description = "Lightshot-style screen capture for Windows: region screenshots, annotations, clipboard and GIF recording"
+description = "Lightshot-style screen capture for Windows and Linux: region screenshots, annotations, clipboard and GIF recording"
 license = "MIT"
 build = "build.rs"
 
@@ -16,7 +16,7 @@ rayon = "1.10"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 
 # WinRT projections, only for the OCR engine built into Windows.
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
     "Foundation",
@@ -28,7 +28,7 @@ features = [
     "Win32_System_WinRT",
 ]
 
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [
     "Win32_Foundation",
@@ -51,6 +51,19 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+ksni = { version = "0.3", features = ["blocking"] }
+libc = "0.2"
+notify-rust = "4"
+pipewire = "0.8"
+softbuffer = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+winit = "0.30"
+x11rb = { version = "0.13", features = ["randr", "xfixes"] }
 
 [build-dependencies]
 embed-resource = "2.5"

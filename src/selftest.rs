@@ -10,11 +10,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::annotate::{self, Rgba, Shape};
-use crate::capture::{self, Grabber};
+use crate::editor;
 use crate::gif_enc::{self, Msg};
-use crate::overlay;
+#[cfg(target_os = "linux")]
+use crate::linux::{capture::Grabber, screen_for_test};
 use crate::text::{self, Fonts};
-use crate::util::Rect;
+use crate::util::{encode_png, Rect};
+#[cfg(windows)]
+use crate::win::{capture::Grabber, overlay::screen_for_test};
 
 pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
     let _ = fs::create_dir_all(dir);
@@ -36,36 +39,36 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
 
     check("capture", {
         let t = Instant::now();
-        let vs = capture::virtual_screen();
-        capture::capture(vs)
-            .ok_or_else(|| "capture returned nothing".to_string())
-            .and_then(|px| {
-                let elapsed = t.elapsed();
-                let png = capture::encode_png(vs.w(), vs.h(), &px)?;
-                fs::write(dir.join("screen.png"), png).map_err(|e| e.to_string())?;
-                Ok(format!("{}x{} at ({}, {}) in {elapsed:?}", vs.w(), vs.h(), vs.l, vs.t))
-            })
+        screen_for_test().ok_or_else(|| "capture returned nothing".to_string()).and_then(|sc| {
+            let elapsed = t.elapsed();
+            let png = encode_png(sc.w, sc.h, &sc.pixels)?;
+            fs::write(dir.join("screen.png"), png).map_err(|e| e.to_string())?;
+            Ok(format!("{}x{} at {:?}, {} monitor(s), in {elapsed:?}", sc.w, sc.h, sc.origin, sc.monitors.len()))
+        })
     });
 
     check("pixelate whole screen", {
-        let vs = capture::virtual_screen();
-        capture::capture(vs).ok_or_else(|| "capture failed".to_string()).map(|px| {
+        screen_for_test().ok_or_else(|| "capture failed".to_string()).map(|sc| {
+            let (px, w, h) = (sc.pixels, sc.w, sc.h);
             let t = Instant::now();
-            let lines = crate::ocr::find_text(&px, vs.w(), vs.h()).map_or(0, |l| l.len());
+            let lines = crate::ocr::find_text(&px, w, h).map_or(0, |l| l.len());
             let ocr = t.elapsed();
             let t = Instant::now();
-            let _ = annotate::make_patch(&px, vs.w(), vs.h(), (0.0, 0.0), (vs.w() as f32, vs.h() as f32), 10.0, 1, &fonts);
+            let _ = annotate::make_patch(&px, w, h, (0.0, 0.0), (w as f32, h as f32), 10.0, 1, &fonts);
             format!("OCR found {lines} text lines in {ocr:?}; full pixelate {:?}", t.elapsed())
         })
     });
 
     check("overlay", {
         let t = Instant::now();
-        overlay::render_preview(fonts.clone(), &dir.join("overlay.png")).map(|_| format!("rendered in {:?}", t.elapsed()))
+        screen_for_test()
+            .ok_or_else(|| "capture failed".to_string())
+            .and_then(|screen| editor::render_preview(fonts.clone(), screen, &dir.join("overlay.png")))
+            .map(|_| format!("rendered in {:?}", t.elapsed()))
     });
 
-    check("text editing", overlay::text_editing_selftest(fonts.clone()));
-    check("drawing", overlay::drawing_selftest(fonts.clone()));
+    check("text editing", editor::text_editing_selftest(fonts.clone()));
+    check("drawing", editor::drawing_selftest(fonts.clone()));
 
     check("outlines", {
         // Every palette color as arrow + text, on a light and a dark panel,
@@ -81,7 +84,7 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
                     img[i..i + 4].copy_from_slice(&[bg.2, bg.1, bg.0, 255]);
                 }
             }
-            for (i, &c) in crate::overlay::PALETTE.iter().enumerate() {
+            for (i, &c) in editor::PALETTE.iter().enumerate() {
                 let x = 15.0 + i as f32 * 55.0;
                 let outline = Some(annotate::auto_outline(c, annotate::luma(bg)));
                 shapes.push(Shape::Arrow { a: (x, y0 as f32 + 115.0), b: (x + 35.0, y0 as f32 + 60.0), color: c, width: 3.0, outline });
@@ -89,8 +92,8 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
             }
         }
         annotate::render(&mut img, w, h, &shapes, 0.0, 0.0, &fonts);
-        let _ = capture::encode_png(w, h, &img).map(|png| fs::write(dir.join("outlines.png"), png));
-        let red = crate::overlay::PALETTE[0];
+        let _ = encode_png(w, h, &img).map(|png| fs::write(dir.join("outlines.png"), png));
+        let red = editor::PALETTE[0];
         match (annotate::auto_outline(red, 255), annotate::auto_outline(red, 30)) {
             (annotate::OUTLINE_BLACK, annotate::OUTLINE_WHITE) => Ok("red gets black on light, white on dark".into()),
             other => Err(format!("unexpected automatic outlines for red: {other:?}")),
@@ -150,7 +153,7 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
                 }
             }
         }
-        let _ = capture::encode_png(w, h * 12, &sheet).map(|png| fs::write(dir.join("pixelate_attack.png"), png));
+        let _ = encode_png(w, h * 12, &sheet).map(|png| fs::write(dir.join("pixelate_attack.png"), png));
         let summary = format!(
             "attack finds the password in plain pixelation {plain_hits}/{trials}, in ours {safe_hits}/{trials} \
              (guessing: 0.3%); OCR found the text {found}/{trials}; {:?} per pixelate",
@@ -206,7 +209,7 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
                 report.push(format!("{name} photo {photo}/text {text}"));
                 let (scrambled, _) = annotate::scramble_preview(&img, w, h, 1, &fonts);
                 let sheet: Vec<u8> = [&img, &scrambled, &plain, &ours].iter().flat_map(|v| v.iter().copied()).collect();
-                let _ = capture::encode_png(w, h * 4, &sheet).map(|png| fs::write(dir.join(format!("{name}_result.png")), png));
+                let _ = encode_png(w, h * 4, &sheet).map(|png| fs::write(dir.join(format!("{name}_result.png")), png));
             }
             if files.is_empty() {
                 Err("no photo_*.png inputs".into())
@@ -264,8 +267,8 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
     });
 
     check("screen recording gif", {
-        let vs = capture::virtual_screen();
-        let region = Rect::xywh(vs.l, vs.t, 800.min(vs.w()), 450.min(vs.h()));
+        let (origin, w, h) = screen_for_test().map_or(((0, 0), 800, 450), |sc| (sc.origin, sc.w, sc.h));
+        let region = Rect::xywh(origin.0, origin.1, 800.min(w), 450.min(h));
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let Some(mut g) = Grabber::new(region.w(), region.h()) else {

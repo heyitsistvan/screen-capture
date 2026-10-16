@@ -1,6 +1,7 @@
-//! Text rasterization with fontdue, using the fonts that ship with Windows.
+//! Text rasterization with fontdue, using the system's fonts (Segoe UI on
+//! Windows, the fontconfig sans-serif font on Linux).
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use fontdue::{Font, FontSettings};
 
@@ -14,24 +15,56 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    #[cfg(windows)]
     pub fn load() -> Result<Fonts, String> {
-        let dir = std::env::var_os("WINDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "C:\\Windows".into())
-            .join("Fonts");
-        let regular = ["segoeui.ttf", "arial.ttf", "tahoma.ttf", "verdana.ttf"];
-        let ui = load_first(&dir, &regular)
-            .ok_or_else(|| format!("No usable font found in {}", dir.display()))?;
-        let bold = load_first(&dir, &["segoeuib.ttf", "arialbd.ttf", "tahomabd.ttf"])
-            .or_else(|| load_first(&dir, &regular))
-            .ok_or_else(|| format!("No usable font found in {}", dir.display()))?;
-        Ok(Fonts { ui, bold })
+        let dir = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| "C:\\Windows".into()).join("Fonts");
+        let paths = |names: &[&str]| names.iter().map(|n| dir.join(n)).collect::<Vec<_>>();
+        let regular = paths(&["segoeui.ttf", "arial.ttf", "tahoma.ttf", "verdana.ttf"]);
+        let bold = paths(&["segoeuib.ttf", "arialbd.ttf", "tahomabd.ttf"]);
+        Self::from_candidates(&regular, &bold).ok_or_else(|| format!("No usable font found in {}", dir.display()))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn load() -> Result<Fonts, String> {
+        let known = |names: &[&str]| -> Vec<PathBuf> {
+            let dirs = [
+                "/usr/share/fonts/truetype/dejavu",
+                "/usr/share/fonts/truetype/noto",
+                "/usr/share/fonts/noto",
+                "/usr/share/fonts/google-noto",
+                "/usr/share/fonts/TTF",
+                "/usr/share/fonts/dejavu",
+                "/usr/share/fonts/truetype/liberation",
+                "/usr/share/fonts/liberation-sans",
+            ];
+            dirs.iter().flat_map(|d| names.iter().map(move |n| std::path::Path::new(d).join(n))).collect()
+        };
+        let mut regular: Vec<PathBuf> = fc_match("sans-serif").into_iter().collect();
+        regular.extend(known(&["NotoSans-Regular.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"]));
+        let mut bold: Vec<PathBuf> = fc_match("sans-serif:bold").into_iter().collect();
+        bold.extend(known(&["NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"]));
+        Self::from_candidates(&regular, &bold)
+            .ok_or_else(|| "No usable font found; install a font such as fonts-dejavu or fonts-noto".into())
+    }
+
+    fn from_candidates(regular: &[PathBuf], bold: &[PathBuf]) -> Option<Fonts> {
+        let ui = load_first(regular)?;
+        let bold = load_first(bold).or_else(|| load_first(regular))?;
+        Some(Fonts { ui, bold })
     }
 }
 
-fn load_first(dir: &Path, names: &[&str]) -> Option<Font> {
-    names.iter().find_map(|n| {
-        let data = std::fs::read(dir.join(n)).ok()?;
+/// The font file fontconfig picks for a pattern.
+#[cfg(target_os = "linux")]
+fn fc_match(pattern: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
+    let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    path.is_file().then_some(path)
+}
+
+fn load_first(paths: &[PathBuf]) -> Option<Font> {
+    paths.iter().find_map(|p| {
+        let data = std::fs::read(p).ok()?;
         Font::from_bytes(data, FontSettings::default()).ok()
     })
 }
