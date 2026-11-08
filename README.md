@@ -104,7 +104,7 @@ On Windows, Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep wor
 
 Capture, Record GIF, GIF frame rate, cursor in GIFs, open the GIF folder, **Start with Windows** /
 **Start at login** (registers the executable's current path; move it to its final location
-first), Exit.
+first), About (version, links to Pixobit Solutions and the source code), Exit.
 
 Command line: `screen-capture --capture` or `--gif` triggers a capture in the running instance
 (handy for binding to another key or a shortcut). Like PrtSc, `--capture` during a recording
@@ -172,3 +172,8 @@ Linux debug builds also have `--dump-screen <file.png>` (save the X screen), `--
 | `text.rs`, `ui.rs`, `icon.rs` | Font rendering, UI drawing and icons, app icon |
 | `win/` | Windows: tray, PrtSc keyboard hook, overlay window, GDI capture, clipboard, WinRT OCR, recording |
 | `linux/` | Linux: tray (StatusNotifierItem), X11 key grab and capture, portals, PipeWire recording, Tesseract OCR, dialogs |
+
+## About
+
+Made by [Pixobit Solutions](https://pixobit.eu). Source code:
+[github.com/heyitsistvan/screen-capture](https://github.com/heyitsistvan/screen-capture).

@@ -1,1 +1,20 @@
+# Build output (also holds target/linux-release, built in WSL)
 /target
+
+# Default output folders of the debug self-tests
+/selftest-out/
+/portal-test/
+
+# rustfmt backups
+**/*.rs.bk
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Personal Claude Code settings
+.claude/settings.local.json

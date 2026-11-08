@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, IsWindow, KillTimer, PostMessageW, PostQuitMessage,
     RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowsHookExW,
     TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HICON, HMENU, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
     MSG, SM_CXSMICON, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
     WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_NULL, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
     WS_POPUP,
@@ -66,6 +66,8 @@ const ID_STOP: usize = 3;
 const ID_OPEN_FOLDER: usize = 4;
 const ID_AUTOSTART: usize = 5;
 const ID_CURSOR: usize = 6;
+const ID_HOMEPAGE: usize = 7;
+const ID_REPOSITORY: usize = 8;
 const ID_EXIT: usize = 9;
 const ID_FPS: usize = 100;
 
@@ -417,6 +419,13 @@ unsafe fn show_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     item(menu, ID_AUTOSTART, "Start with Windows", autostart);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    let about = CreatePopupMenu();
+    let version = wide(&format!("{} {}", util::APP_NAME, util::VERSION));
+    AppendMenuW(about, MF_STRING | MF_GRAYED, 0, version.as_ptr());
+    item(about, ID_HOMEPAGE, &format!("Made by {} (pixobit.eu)", util::MAKER), false);
+    item(about, ID_REPOSITORY, "Source code on GitHub", false);
+    let label = wide("About");
+    AppendMenuW(menu, MF_POPUP, about as usize, label.as_ptr());
     item(menu, ID_EXIT, "Exit", false);
     SetMenuDefaultItem(menu, ID_CAPTURE as u32, 0);
 
@@ -450,6 +459,8 @@ unsafe fn on_command(hwnd: HWND, cmd: usize) {
                 util::message_box(hwnd, "Could not change the startup setting.", MB_ICONWARNING);
             }
         }
+        ID_HOMEPAGE => open_url(util::HOMEPAGE),
+        ID_REPOSITORY => open_url(util::REPOSITORY),
         ID_EXIT => {
             DestroyWindow(hwnd);
         }
@@ -465,6 +476,12 @@ fn shell_open(path: &Path) {
     let verb = wide("open");
     let p = util::wide_path(path);
     unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), p.as_ptr(), null(), null(), SW_SHOWNORMAL) };
+}
+
+/// Opens a web page in the default browser.
+fn open_url(url: &str) {
+    let (verb, u) = (wide("open"), wide(url));
+    unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), u.as_ptr(), null(), null(), SW_SHOWNORMAL) };
 }
 
 fn show_in_folder(path: &Path) {

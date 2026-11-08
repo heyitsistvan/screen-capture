@@ -53,6 +53,8 @@ pub enum Cmd {
     ToggleCursor,
     SetFps(u32),
     ToggleAutostart,
+    /// A web page from the About menu.
+    OpenUrl(&'static str),
     Exit,
 }
 
@@ -665,6 +667,7 @@ impl App {
                     notify::show("Couldn't change the startup setting", "");
                 }
             }
+            Cmd::OpenUrl(url) => notify::open(url),
             Cmd::Exit => {
                 if let Some(mut r) = self.rec.take() {
                     r.cancel();

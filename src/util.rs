@@ -4,6 +4,11 @@
 use std::path::PathBuf;
 
 pub const APP_NAME: &str = "Screen Capture";
+/// For the About menu (from Cargo.toml).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const MAKER: &str = "Pixobit Solutions";
+pub const HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Where recorded GIFs (and quick saves) go.
 pub fn captures_dir() -> PathBuf {

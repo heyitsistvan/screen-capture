@@ -1,5 +1,6 @@
 //! Desktop notifications (org.freedesktop.Notifications).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -60,6 +61,7 @@ pub fn show_in_folder(file: &Path) {
     }
 }
 
-pub fn open(path: &Path) {
-    let _ = Command::new("xdg-open").arg(path).spawn();
+/// Opens a file, folder or web page with the default program.
+pub fn open(target: impl AsRef<OsStr>) {
+    let _ = Command::new("xdg-open").arg(target).spawn();
 }

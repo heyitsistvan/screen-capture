@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Lightshot-style screen capture for Windows and Linux: region screenshots, annotations, clipboard and GIF recording"
 license = "MIT"
+authors = ["Pixobit Solutions"]
+homepage = "https://pixobit.eu"
+repository = "https://github.com/heyitsistvan/screen-capture"
 build = "build.rs"
 
 [dependencies]

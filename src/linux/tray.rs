@@ -8,7 +8,7 @@ use winit::event_loop::EventLoopProxy;
 use super::{Cmd, UserEvent};
 use crate::icon;
 use crate::settings::FPS_CHOICES;
-use crate::util::APP_NAME;
+use crate::util::{APP_NAME, HOMEPAGE, MAKER, REPOSITORY, VERSION};
 
 pub struct TrayModel {
     pub proxy: EventLoopProxy<UserEvent>,
@@ -71,6 +71,11 @@ impl Tray for TrayModel {
             .into()
         };
         let fps = FPS_CHOICES.iter().map(|&f| check(&format!("{f} fps"), f == self.fps, Cmd::SetFps(f))).collect();
+        let about = vec![
+            StandardItem { label: format!("{APP_NAME} {VERSION}"), enabled: false, ..Default::default() }.into(),
+            item(&format!("Made by {MAKER} (pixobit.eu)"), Cmd::OpenUrl(HOMEPAGE)),
+            item("Source code on GitHub", Cmd::OpenUrl(REPOSITORY)),
+        ];
         vec![
             item("Capture area (PrtSc)", Cmd::Capture),
             if self.recording {
@@ -85,6 +90,7 @@ impl Tray for TrayModel {
             MenuItem::Separator,
             check("Start at login", self.autostart, Cmd::ToggleAutostart),
             MenuItem::Separator,
+            SubMenu { label: "About".into(), submenu: about, ..Default::default() }.into(),
             item("Exit", Cmd::Exit),
         ]
     }
