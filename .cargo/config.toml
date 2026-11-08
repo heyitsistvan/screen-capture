@@ -1,0 +1,4 @@
+# Link the C runtime statically on Windows, so the exe runs on machines
+# without the Visual C++ Redistributable (no vcruntime140.dll needed).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
