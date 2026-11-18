@@ -8,23 +8,32 @@ use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, ModMask};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
+use crate::editor::Mode;
+
 const XK_PRINT: u32 = 0xff61;
 
-/// Grabs PrtSc and Shift+PrtSc and calls `on_press(shift)` from a background
-/// thread for each press.
-pub fn grab_print(on_press: impl Fn(bool) + Send + 'static) -> Result<(), String> {
+/// Grabs PrtSc, Ctrl+PrtSc (pin) and Shift+PrtSc (GIF) and calls
+/// `on_press(mode)` from a background thread for each press. Fails only if
+/// plain PrtSc can't be had; returns the other combinations that another
+/// program already uses.
+pub fn grab_print(on_press: impl Fn(Mode) + Send + 'static) -> Result<Vec<&'static str>, String> {
     let (conn, screen) = x11rb::connect(None).map_err(|e| e.to_string())?;
     let root = conn.setup().roots[screen].root;
     let keycode = print_keycode(&conn).ok_or("there's no PrtSc key in the keyboard layout")?;
     // Grab with every combination of the lock modifiers, or Caps/Num Lock
     // being on would let the key through.
     let locks = [ModMask::from(0u16), ModMask::LOCK, ModMask::M2, ModMask::LOCK | ModMask::M2];
-    for base in [ModMask::from(0u16), ModMask::SHIFT] {
-        for lock in locks {
+    let mut taken = Vec::new();
+    for (base, name) in [(ModMask::from(0u16), "PrtSc"), (ModMask::CONTROL, "Ctrl+PrtSc"), (ModMask::SHIFT, "Shift+PrtSc")] {
+        let grabbed = locks.iter().all(|&lock| {
             conn.grab_key(true, root, base | lock, keycode, GrabMode::ASYNC, GrabMode::ASYNC)
-                .map_err(|e| e.to_string())?
-                .check()
-                .map_err(|_| "another program already uses PrtSc".to_string())?;
+                .is_ok_and(|cookie| cookie.check().is_ok())
+        });
+        if !grabbed {
+            if base == ModMask::from(0u16) {
+                return Err("another program already uses PrtSc".into());
+            }
+            taken.push(name);
         }
     }
     conn.flush().map_err(|e| e.to_string())?;
@@ -35,12 +44,19 @@ pub fn grab_print(on_press: impl Fn(bool) + Send + 'static) -> Result<(), String
                 // Holding the key auto-repeats; one press is one capture.
                 if k.detail == keycode && last.elapsed() > Duration::from_millis(400) {
                     last = Instant::now();
-                    on_press(u16::from(k.state) & u16::from(ModMask::SHIFT) != 0);
+                    let state = u16::from(k.state);
+                    on_press(if state & u16::from(ModMask::CONTROL) != 0 {
+                        Mode::Pin
+                    } else if state & u16::from(ModMask::SHIFT) != 0 {
+                        Mode::Gif
+                    } else {
+                        Mode::Capture
+                    });
                 }
             }
         }
     });
-    Ok(())
+    Ok(taken)
 }
 
 fn print_keycode(conn: &RustConnection) -> Option<u8> {

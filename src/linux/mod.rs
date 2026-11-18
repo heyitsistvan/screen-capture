@@ -1,6 +1,6 @@
 //! The Linux app: tray icon, PrtSc (an X11 key grab, or the Wayland
-//! GlobalShortcuts portal), single instance, the editor window and GIF
-//! recording. X11 and Wayland differ mainly in how pixels are captured:
+//! GlobalShortcuts portal), single instance, the editor window, pinned
+//! captures, the recent-captures history and GIF recording. X11 and Wayland differ mainly in how pixels are captured:
 //! directly on X11, through desktop portals on Wayland.
 
 pub mod capture;
@@ -8,6 +8,7 @@ mod dialogs;
 mod hotkey;
 mod notify;
 pub mod ocr;
+mod pin;
 mod portal;
 mod record;
 mod tray;
@@ -33,12 +34,14 @@ use winit::platform::wayland::EventLoopExtWayland;
 use winit::window::WindowId;
 
 use self::capture::X11;
+use self::pin::{PinEvent, PinWindow};
 use self::record::{GifOutcome, Recording, Source};
 use self::tray::TrayModel;
 use self::window::EditorWindow;
-use crate::annotate::Rgba;
-use crate::editor::{self, Action, GifRequest, Screen};
+use crate::annotate::{Rgba, Shape};
+use crate::editor::{self, Action, GifRequest, Mode, Screen};
 use crate::gif_enc;
+use crate::history::{self, History};
 use crate::recbar::BarBtn;
 use crate::settings::{self, Settings};
 use crate::text::Fonts;
@@ -47,8 +50,13 @@ use crate::util::{self, Rect, APP_NAME};
 #[derive(Clone, Copy, Debug)]
 pub enum Cmd {
     Capture,
+    Pin,
     Gif,
     Stop,
+    /// Pin a capture from the history again.
+    PinHistory(u64),
+    ClearHistory,
+    ClosePins,
     OpenFolder,
     ToggleCursor,
     SetFps(u32),
@@ -59,17 +67,53 @@ pub enum Cmd {
 }
 
 pub enum UserEvent {
-    /// PrtSc (with Shift for a GIF); Wayland may pass a focus token.
-    Hotkey { gif: bool, activation: Option<String> },
+    /// PrtSc (Ctrl to pin, Shift for a GIF); Wayland may pass a focus token.
+    Hotkey { mode: Mode, activation: Option<String> },
     Command(Cmd),
     /// A Wayland screenshot from the portal.
-    Screenshot { result: Result<(i32, i32, Vec<u8>), String>, gif: bool, activation: Option<String> },
+    Screenshot { result: Result<(i32, i32, Vec<u8>), String>, mode: Mode, activation: Option<String> },
     /// Save dialog result: `None` if no dialog program, `Some(None)` if cancelled.
     SaveTo(Option<Option<PathBuf>>),
     ColorChosen { color: Option<Option<Rgba>>, outline: bool },
     CastStarted(Result<portal::Cast, String>),
     RecordingDone(GifOutcome),
     ShortcutsUnavailable(String),
+    /// A finished capture, compressed for the history.
+    HistoryAdd(history::Entry),
+}
+
+/// An image waiting for the save dialog.
+struct PendingSave {
+    image: (i32, i32, Vec<u8>),
+    from: SaveFrom,
+}
+
+enum SaveFrom {
+    /// The editor, which closes once saved; the capture was at this screen
+    /// position (for the history), and may have been an edit of a pin.
+    Editor((i32, i32), Option<PinUpdate>),
+    Pin(WindowId),
+}
+
+/// The picture without drawings and the drawings, kept by pins so they can be
+/// edited again.
+type Layers = Option<(Vec<u8>, Vec<Shape>)>;
+
+/// An edited picture for the pin it came from.
+struct PinUpdate {
+    target: WindowId,
+    layers: Layers,
+}
+
+/// A pin being edited: its picture without drawings, the drawings, and where
+/// it is on screen (unknown on Wayland).
+struct EditPin {
+    target: WindowId,
+    w: i32,
+    h: i32,
+    base: Vec<u8>,
+    shapes: Vec<Shape>,
+    at: Option<(i32, i32)>,
 }
 
 const BAR_TICK: Duration = Duration::from_millis(250);
@@ -80,8 +124,7 @@ struct App {
     fonts: Arc<Fonts>,
     settings: Settings,
     editor: Option<EditorWindow>,
-    /// The image waiting for the save dialog.
-    pending_save: Option<(i32, i32, Vec<u8>)>,
+    pending_save: Option<PendingSave>,
     dialog_open: bool,
     rec: Option<Recording>,
     /// Wayland: a GIF waiting for the screen cast to start.
@@ -92,8 +135,15 @@ struct App {
     /// Owns clipboard contents: on Linux they're served by this process.
     clipboard: Option<arboard::Clipboard>,
     capturing: bool,
-    delayed_capture: Option<(Instant, bool)>,
+    delayed_capture: Option<(Instant, Mode, Option<String>)>,
     x11: Option<X11>,
+    pins: Vec<PinWindow>,
+    /// Pins are hidden while the editor is open, so new captures don't
+    /// include them.
+    pins_hidden: bool,
+    history: History,
+    /// The pin the editor is editing (finishing updates it).
+    edit: Option<EditPin>,
 }
 
 pub fn run() {
@@ -125,6 +175,7 @@ pub fn run() {
     }
     let request = args.iter().find_map(|a| match a.as_str() {
         "--capture" => Some("capture"),
+        "--pin" => Some("pin"),
         "--gif" => Some("gif"),
         "--stop" => Some("stop"),
         _ => None,
@@ -171,6 +222,8 @@ pub fn run() {
         fps: settings.fps,
         cursor: settings.cursor,
         autostart: settings::autostart_enabled(),
+        history: Vec::new(),
+        pins: 0,
     };
     let tray = match model.spawn() {
         Ok(handle) => Some(handle),
@@ -184,8 +237,8 @@ pub fn run() {
         let p = proxy.clone();
         portal::runtime().spawn(async move {
             let presses = p.clone();
-            let on_press = move |gif, activation| {
-                let _ = presses.send_event(UserEvent::Hotkey { gif, activation });
+            let on_press = move |mode, activation| {
+                let _ = presses.send_event(UserEvent::Hotkey { mode, activation });
             };
             if let Err(e) = portal::global_shortcuts(on_press).await {
                 let _ = p.send_event(UserEvent::ShortcutsUnavailable(e));
@@ -193,11 +246,23 @@ pub fn run() {
         });
     } else {
         let p = proxy.clone();
-        let grabbed = hotkey::grab_print(move |gif| {
-            let _ = p.send_event(UserEvent::Hotkey { gif, activation: None });
+        let grabbed = hotkey::grab_print(move |mode| {
+            let _ = p.send_event(UserEvent::Hotkey { mode, activation: None });
         });
-        if let Err(e) = grabbed {
-            notify::show("PrtSc isn't available", &format!("{e}. Capture from the tray icon, or bind a key to “{} --capture”.", exe()));
+        match grabbed {
+            Err(e) => notify::show(
+                "PrtSc isn't available",
+                &format!("{e}. Capture from the tray icon, or bind a key to “{} --capture”.", exe()),
+            ),
+            Ok(taken) if !taken.is_empty() => notify::show(
+                "Some shortcuts aren't available",
+                &format!(
+                    "Another program uses {}. Use the tray icon, or bind other keys to “{1} --pin” and “{1} --gif”.",
+                    taken.join(" and "),
+                    exe()
+                ),
+            ),
+            Ok(_) => {}
         }
     }
 
@@ -205,12 +270,15 @@ pub fn run() {
         Some("gif") => {
             let _ = proxy.send_event(UserEvent::Command(Cmd::Gif));
         }
+        Some("pin") => {
+            let _ = proxy.send_event(UserEvent::Command(Cmd::Pin));
+        }
         Some(_) => {
             let _ = proxy.send_event(UserEvent::Command(Cmd::Capture));
         }
         None if first_run => notify::show(
             &format!("{APP_NAME} is running"),
-            "Press PrtSc to capture an area, Shift+PrtSc to record a GIF.",
+            "Press PrtSc to capture an area, Ctrl+PrtSc to pin it on screen, Shift+PrtSc to record a GIF.",
         ),
         None => {}
     }
@@ -232,6 +300,10 @@ pub fn run() {
         capturing: false,
         delayed_capture: None,
         x11: None,
+        pins: Vec::new(),
+        pins_hidden: false,
+        history: History::default(),
+        edit: None,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("{e}");
@@ -327,7 +399,8 @@ fn socket_path() -> PathBuf {
     }
 }
 
-/// Accepts commands from later instances (`--capture`, `--gif`, `--stop`).
+/// Accepts commands from later instances (`--capture`, `--pin`, `--gif`,
+/// `--stop`).
 fn listen(proxy: EventLoopProxy<UserEvent>) {
     let path = socket_path();
     let _ = std::fs::remove_file(&path); // a stale socket from a crash
@@ -340,6 +413,7 @@ fn listen(proxy: EventLoopProxy<UserEvent>) {
             }
             let cmd = match line.trim() {
                 "capture" => Cmd::Capture,
+                "pin" => Cmd::Pin,
                 "gif" => Cmd::Gif,
                 "stop" => Cmd::Stop,
                 _ => continue,
@@ -347,6 +421,11 @@ fn listen(proxy: EventLoopProxy<UserEvent>) {
             let _ = proxy.send_event(UserEvent::Command(cmd));
         }
     });
+}
+
+/// The editor's selection as layers, for a pin that can be edited again.
+fn layers(ed: &mut EditorWindow) -> Layers {
+    ed.editor.layers().map(|(_, _, base, shapes)| (base, shapes))
 }
 
 fn monitor_rect(m: &MonitorHandle) -> Rect {
@@ -357,12 +436,16 @@ fn monitor_rect(m: &MonitorHandle) -> Rect {
 impl App {
     fn update_tray(&self) {
         let (recording, fps, cursor) = (self.rec.as_ref().is_some_and(Recording::is_capturing), self.settings.fps, self.settings.cursor);
+        let history: Vec<_> = self.history.iter().map(|e| (e.id, e.label(), e.thumb_png.clone())).collect();
+        let pins = self.pins.len();
         if let Some(t) = &self.tray {
             t.update(|m| {
                 m.recording = recording;
                 m.fps = fps;
                 m.cursor = cursor;
                 m.autostart = settings::autostart_enabled();
+                m.history = history.clone();
+                m.pins = pins;
             });
         }
     }
@@ -371,6 +454,8 @@ impl App {
     /// outline choice is remembered across restarts.
     fn close_editor(&mut self) {
         self.editor = None;
+        self.edit = None;
+        self.show_pins(true);
         let outline = editor::outline_setting();
         if outline != self.settings.outline {
             self.settings.outline = outline;
@@ -386,7 +471,7 @@ impl App {
     }
 
     /// PrtSc, the tray or `--capture`: open the editor (or stop a recording).
-    fn begin_capture(&mut self, el: &ActiveEventLoop, gif: bool, activation: Option<String>) {
+    fn begin_capture(&mut self, el: &ActiveEventLoop, mode: Mode, activation: Option<String>) {
         if self.rec.as_ref().is_some_and(Recording::is_capturing) {
             self.stop_gif();
             return;
@@ -394,8 +479,15 @@ impl App {
         if self.editor.is_some() || self.capturing {
             return;
         }
-        if gif && self.rec.is_some() {
+        if mode == Mode::Gif && self.rec.is_some() {
             notify::show("Still encoding the previous GIF", "Try again in a moment.");
+            return;
+        }
+        // Keep pins out of the new screenshot: hide them and give the screen a
+        // moment to redraw. They're back when the editor closes.
+        if !self.pins.is_empty() && !self.pins_hidden {
+            self.show_pins(false);
+            self.delayed_capture = Some((Instant::now() + Duration::from_millis(150), mode, activation));
             return;
         }
         if self.wayland {
@@ -403,7 +495,7 @@ impl App {
             let proxy = self.proxy.clone();
             portal::runtime().spawn(async move {
                 let result = portal::screenshot().await;
-                let _ = proxy.send_event(UserEvent::Screenshot { result, gif, activation });
+                let _ = proxy.send_event(UserEvent::Screenshot { result, mode, activation });
             });
             return;
         }
@@ -412,23 +504,46 @@ impl App {
         }
         let Some(screen) = self.x11.as_ref().and_then(capture::monitor_screen) else {
             notify::show("Couldn't capture the screen", "The X server refused the screenshot.");
+            self.capture_failed();
             return;
         };
         let origin = PhysicalPosition::new(screen.origin.0, screen.origin.1);
         let monitor = el.available_monitors().find(|m| m.position() == origin);
-        self.open_editor(el, screen, monitor, gif, None);
+        self.open_editor(el, screen, monitor, mode, None);
     }
 
-    fn open_editor(&mut self, el: &ActiveEventLoop, screen: Screen, monitor: Option<MonitorHandle>, gif: bool, activation: Option<String>) {
-        match EditorWindow::open(el, screen, monitor, self.fonts.clone(), gif, activation) {
-            Ok(w) => self.editor = Some(w),
-            Err(e) => notify::show("Couldn't open the editor", &e),
+    fn open_editor(&mut self, el: &ActiveEventLoop, mut screen: Screen, monitor: Option<MonitorHandle>, mode: Mode, activation: Option<String>) {
+        // Editing a pin: its picture goes back where the pin is (or in the
+        // middle, on Wayland), selected, with its drawings.
+        let preset = self.edit.as_ref().map(|e| {
+            let middle = (screen.origin.0 + (screen.w - e.w) / 2, screen.origin.1 + (screen.h - e.h) / 2);
+            (screen.place(e.at.unwrap_or(middle), e.w, e.h, &e.base), e.shapes.clone())
+        });
+        match EditorWindow::open(el, screen, monitor, self.fonts.clone(), mode, activation) {
+            Ok(mut w) => {
+                if let Some((sel, shapes)) = preset {
+                    w.editor.preset(sel, shapes);
+                    w.sync();
+                }
+                self.editor = Some(w);
+            }
+            Err(e) => {
+                notify::show("Couldn't open the editor", &e);
+                self.capture_failed();
+            }
         }
+    }
+
+    /// The screenshot or the editor didn't work out: pins come back, and an
+    /// edit is off.
+    fn capture_failed(&mut self) {
+        self.show_pins(true);
+        self.edit = None;
     }
 
     /// Wayland: the portal's screenshot covers the whole desktop; cut out the
     /// monitor the editor goes on.
-    fn screenshot_arrived(&mut self, el: &ActiveEventLoop, w: i32, h: i32, px: Vec<u8>, gif: bool, activation: Option<String>) {
+    fn screenshot_arrived(&mut self, el: &ActiveEventLoop, w: i32, h: i32, px: Vec<u8>, mode: Mode, activation: Option<String>) {
         let monitors: Vec<MonitorHandle> = el.available_monitors().collect();
         let target = el.primary_monitor().or_else(|| monitors.first().cloned());
         let desktop = monitors.iter().map(monitor_rect).fold(Rect::default(), |a, r| a.union(&r));
@@ -443,6 +558,7 @@ impl App {
         };
         if crop.is_empty() {
             notify::show("Couldn't capture the screen", "The screenshot didn't match the monitors.");
+            self.capture_failed();
             return;
         }
         let mut pixels = Vec::with_capacity(crop.w() as usize * crop.h() as usize * 4);
@@ -461,7 +577,109 @@ impl App {
             mouse: local.center(),
             origin: (0, 0),
         };
-        self.open_editor(el, screen, target, gif, activation);
+        self.open_editor(el, screen, target, mode, activation);
+    }
+
+    /// Puts an image on the clipboard; false if that failed.
+    fn set_clipboard_image(&mut self, w: i32, h: i32, bgra: &[u8]) -> bool {
+        let rgba: Vec<u8> = bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+        let image = arboard::ImageData { width: w as usize, height: h as usize, bytes: Cow::Owned(rgba) };
+        self.clipboard().is_some_and(|c| c.set_image(image).is_ok())
+    }
+
+    /// Keeps a finished capture in the history (compressed on a worker
+    /// thread).
+    fn remember(&self, w: i32, h: i32, pixels: Vec<u8>, at: (i32, i32)) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            if let Some(entry) = history::Entry::new(w, h, &pixels, at) {
+                let _ = proxy.send_event(UserEvent::HistoryAdd(entry));
+            }
+        });
+    }
+
+    fn open_pin(&mut self, el: &ActiveEventLoop, w: i32, h: i32, pixels: Vec<u8>, layers: Layers, at: (i32, i32)) {
+        if !self.wayland && self.x11.is_none() {
+            self.x11 = X11::connect(); // for the opacity
+        }
+        match PinWindow::open(el, w, h, pixels, layers, at, self.wayland) {
+            Ok(p) => self.pins.push(p),
+            Err(e) => notify::show("Couldn't pin the capture", &e),
+        }
+        self.update_tray();
+    }
+
+    fn pin_history(&mut self, el: &ActiveEventLoop, id: u64) {
+        let found = self.history.get(id).and_then(|e| Some((e.image()?, e.at)));
+        if let Some(((w, h, px), at)) = found {
+            self.open_pin(el, w, h, px, None, at);
+        }
+    }
+
+    /// Shows an edited picture in the pin it came from (or a new pin, if
+    /// that one was closed meanwhile).
+    fn update_pin(&mut self, el: &ActiveEventLoop, update: PinUpdate, w: i32, h: i32, pixels: Vec<u8>, at: (i32, i32)) {
+        match self.pins.iter_mut().find(|p| p.window.id() == update.target) {
+            Some(p) => p.replace(w, h, pixels, update.layers),
+            None => self.open_pin(el, w, h, pixels, update.layers, at),
+        }
+    }
+
+    /// Reopens a pin in the editor, over the screen where it is, with its
+    /// drawings still editable; finishing updates the pin.
+    fn edit_pin(&mut self, el: &ActiveEventLoop, id: WindowId) {
+        if self.editor.is_some() || self.capturing || self.rec.as_ref().is_some_and(Recording::is_capturing) {
+            return;
+        }
+        let Some(p) = self.pins.iter().find(|p| p.window.id() == id) else { return };
+        let (w, h, base, shapes, at) = p.content();
+        self.edit = Some(EditPin { target: id, w, h, base, shapes, at });
+        self.begin_capture(el, Mode::Pin, None);
+    }
+
+    fn show_pins(&mut self, show: bool) {
+        if self.pins_hidden != show {
+            return;
+        }
+        self.pins_hidden = !show;
+        for p in &self.pins {
+            p.window.set_visible(show);
+        }
+    }
+
+    fn close_pins(&mut self) {
+        self.pins.clear();
+        self.update_tray();
+    }
+
+    fn pin_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: PinEvent) {
+        let Some(i) = self.pins.iter().position(|p| p.window.id() == id) else { return };
+        match ev {
+            PinEvent::Close => {
+                self.pins.remove(i);
+                self.update_tray();
+            }
+            PinEvent::Edit => self.edit_pin(el, id),
+            PinEvent::Copy => {
+                let (w, h, px) = self.pins[i].pin.image();
+                let px = px.to_vec();
+                let ok = self.set_clipboard_image(w, h, &px);
+                self.pins[i].badge(if ok { "Copied" } else { "Couldn't copy to the clipboard" });
+            }
+            PinEvent::Save => {
+                if self.dialog_open {
+                    return;
+                }
+                let (w, h, px) = self.pins[i].pin.image();
+                self.pending_save = Some(PendingSave { image: (w, h, px.to_vec()), from: SaveFrom::Pin(id) });
+                self.dialog_open = true;
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let default = util::pictures_dir().join(format!("Screenshot_{}.png", util::timestamp()));
+                    let _ = proxy.send_event(UserEvent::SaveTo(dialogs::save_png(&default, None)));
+                });
+            }
+        }
     }
 
     fn perform(&mut self, el: &ActiveEventLoop, action: Action) {
@@ -470,9 +688,13 @@ impl App {
             Action::Close => self.close_editor(),
             Action::Copy => {
                 let Some((w, h, px)) = ed.editor.final_image() else { return };
-                let rgba: Vec<u8> = px.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 255]).collect();
-                let image = arboard::ImageData { width: w as usize, height: h as usize, bytes: Cow::Owned(rgba) };
-                if self.clipboard().is_some_and(|c| c.set_image(image).is_ok()) {
+                let at = ed.editor.selection_on_screen().map_or((0, 0), |r| (r.l, r.t));
+                let update = self.edit.as_ref().map(|e| e.target).map(|target| PinUpdate { target, layers: layers(ed) });
+                if self.set_clipboard_image(w, h, &px) {
+                    if let Some(u) = update {
+                        self.update_pin(el, u, w, h, px.clone(), at);
+                    }
+                    self.remember(w, h, px, at);
                     self.close_editor();
                 } else if let Some(ed) = self.editor.as_mut() {
                     ed.editor.show_flash("Couldn't copy to the clipboard, try again".into());
@@ -484,14 +706,30 @@ impl App {
                     return;
                 }
                 let Some(image) = ed.editor.final_image() else { return };
+                let at = ed.editor.selection_on_screen().map_or((0, 0), |r| (r.l, r.t));
+                let update = self.edit.as_ref().map(|e| e.target).map(|target| PinUpdate { target, layers: layers(ed) });
                 let parent = ed.x11_id();
-                self.pending_save = Some(image);
+                self.pending_save = Some(PendingSave { image, from: SaveFrom::Editor(at, update) });
                 self.dialog_open = true;
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
                     let default = util::pictures_dir().join(format!("Screenshot_{}.png", util::timestamp()));
                     let _ = proxy.send_event(UserEvent::SaveTo(dialogs::save_png(&default, parent)));
                 });
+            }
+            Action::Pin => {
+                let Some((w, h, px)) = ed.editor.final_image() else { return };
+                let at = ed.editor.selection_on_screen().map_or((0, 0), |r| (r.l, r.t));
+                let layers = layers(ed);
+                let target = self.edit.as_ref().map(|e| e.target);
+                // Pin even if the clipboard can't be had.
+                self.set_clipboard_image(w, h, &px);
+                self.close_editor();
+                match target {
+                    Some(target) => self.update_pin(el, PinUpdate { target, layers }, w, h, px.clone(), at),
+                    None => self.open_pin(el, w, h, px.clone(), layers, at),
+                }
+                self.remember(w, h, px, at);
             }
             Action::Gif => {
                 let req = ed.editor.gif_request();
@@ -525,9 +763,9 @@ impl App {
         }
     }
 
-    fn save_chosen(&mut self, choice: Option<Option<PathBuf>>) {
+    fn save_chosen(&mut self, el: &ActiveEventLoop, choice: Option<Option<PathBuf>>) {
         self.dialog_open = false;
-        let Some((w, h, px)) = self.pending_save.take() else { return };
+        let Some(PendingSave { image: (w, h, px), from }) = self.pending_save.take() else { return };
         let quick = choice.is_none();
         let path = match choice {
             Some(None) => return, // cancelled: keep editing
@@ -544,7 +782,20 @@ impl App {
                 if quick {
                     notify::show_file("Screenshot saved", &path.display().to_string(), &path);
                 }
-                self.close_editor();
+                match from {
+                    SaveFrom::Editor(at, update) => {
+                        if let Some(u) = update {
+                            self.update_pin(el, u, w, h, px.clone(), at);
+                        }
+                        self.remember(w, h, px, at);
+                        self.close_editor();
+                    }
+                    SaveFrom::Pin(id) => {
+                        if let Some(p) = self.pins.iter_mut().find(|p| p.window.id() == id) {
+                            p.badge("Saved");
+                        }
+                    }
+                }
             }
             Err(e) => notify::show("Couldn't save the screenshot", &format!("{}: {e}", path.display())),
         }
@@ -646,9 +897,13 @@ impl App {
     fn command(&mut self, el: &ActiveEventLoop, cmd: Cmd) {
         match cmd {
             // A short delay lets the tray menu close before the screenshot.
-            Cmd::Capture => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), false)),
-            Cmd::Gif => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), true)),
+            Cmd::Capture => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Capture, None)),
+            Cmd::Pin => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Pin, None)),
+            Cmd::Gif => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Gif, None)),
             Cmd::Stop => self.stop_gif(),
+            Cmd::PinHistory(id) => self.pin_history(el, id),
+            Cmd::ClearHistory => self.history.clear(),
+            Cmd::ClosePins => self.close_pins(),
             Cmd::OpenFolder => {
                 let dir = util::captures_dir();
                 let _ = std::fs::create_dir_all(&dir);
@@ -693,11 +948,13 @@ impl ApplicationHandler<UserEvent> for App {
                 ed.fire_timers();
             }
         }
-        if let Some((at, gif)) = self.delayed_capture {
-            if at <= now {
-                self.delayed_capture = None;
-                self.begin_capture(el, gif, None);
+        if self.delayed_capture.as_ref().is_some_and(|d| d.0 <= now) {
+            if let Some((_, mode, activation)) = self.delayed_capture.take() {
+                self.begin_capture(el, mode, activation);
             }
+        }
+        for p in &mut self.pins {
+            p.tick(now);
         }
         if self.rec.is_some() && self.next_tick <= now {
             self.next_tick = now + BAR_TICK;
@@ -710,8 +967,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let deadlines = [
             self.editor.as_ref().and_then(EditorWindow::next_timer),
-            self.delayed_capture.map(|d| d.0),
+            self.delayed_capture.as_ref().map(|d| d.0),
             self.rec.as_ref().map(|_| self.next_tick),
+            self.pins.iter().filter_map(PinWindow::next_deadline).min(),
         ];
         match deadlines.into_iter().flatten().min() {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
@@ -721,16 +979,23 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         match ev {
-            UserEvent::Hotkey { gif, activation } => self.begin_capture(el, gif, activation),
+            UserEvent::Hotkey { mode, activation } => self.begin_capture(el, mode, activation),
             UserEvent::Command(cmd) => self.command(el, cmd),
-            UserEvent::Screenshot { result, gif, activation } => {
+            UserEvent::Screenshot { result, mode, activation } => {
                 self.capturing = false;
                 match result {
-                    Ok((w, h, px)) => self.screenshot_arrived(el, w, h, px, gif, activation),
-                    Err(e) => notify::show("Couldn't take a screenshot", &e),
+                    Ok((w, h, px)) => self.screenshot_arrived(el, w, h, px, mode, activation),
+                    Err(e) => {
+                        notify::show("Couldn't take a screenshot", &e);
+                        self.capture_failed();
+                    }
                 }
             }
-            UserEvent::SaveTo(choice) => self.save_chosen(choice),
+            UserEvent::HistoryAdd(entry) => {
+                self.history.push(entry);
+                self.update_tray();
+            }
+            UserEvent::SaveTo(choice) => self.save_chosen(el, choice),
             UserEvent::ColorChosen { color, outline } => self.color_chosen(color, outline),
             UserEvent::CastStarted(result) => {
                 let pending = self.pending_gif.take();
@@ -756,7 +1021,8 @@ impl ApplicationHandler<UserEvent> for App {
                         "Set up the PrtSc shortcut",
                         &format!(
                             "Your desktop doesn't let apps register shortcuts. In Settings → Keyboard → Custom Shortcuts, \
-                             add PrtSc running “{0} --capture” and Shift+PrtSc running “{0} --gif”.",
+                             add PrtSc running “{0} --capture”, Ctrl+PrtSc running “{0} --pin” and Shift+PrtSc \
+                             running “{0} --gif”.",
                             exe()
                         ),
                     );
@@ -770,6 +1036,12 @@ impl ApplicationHandler<UserEvent> for App {
             let action = self.editor.as_mut().and_then(|e| e.event(ev));
             if let Some(a) = action {
                 self.perform(el, a);
+            }
+            return;
+        }
+        if let Some(i) = self.pins.iter().position(|p| p.window.id() == id) {
+            if let Some(e) = self.pins[i].event(ev, self.x11.as_ref(), &self.fonts) {
+                self.pin_event(el, id, e);
             }
             return;
         }

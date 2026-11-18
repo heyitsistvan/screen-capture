@@ -37,10 +37,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::annotate::Rgba;
 use super::capture::{self, Dib};
 use super::clipboard;
-use crate::editor::{Action, Cursor, Editor, Host, Mods, Screen};
+use crate::editor::{Action, Cursor, Editor, Host, Mode, Mods, Screen};
 use crate::text::Fonts;
 use crate::util::{self, wide, Rect};
-use super::{WM_APP_OVERLAY_DONE, WM_APP_START_GIF};
+use super::{Captured, EditPin, WM_APP_CAPTURED, WM_APP_OVERLAY_DONE, WM_APP_START_GIF};
 
 const CLASS: &str = "ScreenCaptureOverlay";
 
@@ -104,6 +104,8 @@ struct Shell {
     /// GDI surface the editor's frames are copied into for BitBlt.
     surface: Dib,
     high_surrogate: Option<u16>,
+    /// Editing this pin: copying, saving or pinning updates it.
+    edit_target: Option<HWND>,
 }
 
 pub fn register_class(hinst: HINSTANCE) {
@@ -119,16 +121,17 @@ pub fn register_class(hinst: HINSTANCE) {
     }
 }
 
-/// Captures the screen and shows the editor over it. Returns the window or
-/// null on failure.
-pub fn open(main: HWND, gif_mode: bool, fonts: Arc<Fonts>) -> HWND {
+/// Captures the screen and shows the editor over it; with `edit`, a pin's
+/// picture goes back where the pin is, selected, with its drawings. Returns
+/// the window or null on failure.
+pub fn open(main: HWND, mode: Mode, fonts: Arc<Fonts>, edit: Option<EditPin>) -> HWND {
     let vs = capture::virtual_screen();
     let Some(pixels) = capture::capture(vs) else { return null_mut() };
     let Some(surface) = Dib::new(vs.w(), vs.h()) else { return null_mut() };
     let mut cur = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut cur) };
     let bounds = Rect::new(0, 0, vs.w(), vs.h());
-    let screen = Screen {
+    let mut screen = Screen {
         w: vs.w(),
         h: vs.h(),
         pixels,
@@ -141,6 +144,7 @@ pub fn open(main: HWND, gif_mode: bool, fonts: Arc<Fonts>) -> HWND {
         mouse: (cur.x - vs.l, cur.y - vs.t),
         origin: (vs.l, vs.t),
     };
+    let preset = edit.map(|e| (screen.place(e.at, e.w, e.h, &e.base), e.shapes, e.target));
     unsafe {
         let cls = wide(CLASS);
         let title = wide(util::APP_NAME);
@@ -161,8 +165,12 @@ pub fn open(main: HWND, gif_mode: bool, fonts: Arc<Fonts>) -> HWND {
         if hwnd.is_null() {
             return null_mut();
         }
-        let editor = Editor::new(Box::new(WinHost { hwnd }), screen, fonts, gif_mode, util::dpi_scale_at(cur.x, cur.y));
-        let shell = Box::new(Shell { editor, main, surface, high_surrogate: None });
+        let mut editor = Editor::new(Box::new(WinHost { hwnd }), screen, fonts, mode, util::dpi_scale_at(cur.x, cur.y));
+        let edit_target = preset.map(|(sel, shapes, target)| {
+            editor.preset(sel, shapes);
+            target
+        });
+        let shell = Box::new(Shell { editor, main, surface, high_surrogate: None, edit_target });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(shell) as isize);
         ShowWindow(hwnd, SW_SHOW);
         SetWindowPos(hwnd, HWND_TOPMOST, vs.l, vs.t, vs.w(), vs.h(), SWP_SHOWWINDOW);
@@ -313,6 +321,7 @@ unsafe fn perform(hwnd: HWND, p: *mut Shell, action: Action) {
         Action::Copy => {
             let Some((w, h, px)) = (*p).editor.final_image() else { return };
             if clipboard::set_image(hwnd, w, h, &px) {
+                captured(p, w, h, px, false);
                 DestroyWindow(hwnd);
             } else {
                 // Another app holds the clipboard: keep the screenshot.
@@ -325,10 +334,18 @@ unsafe fn perform(hwnd: HWND, p: *mut Shell, action: Action) {
             match util::encode_png(w, h, &px).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()))
             {
                 Ok(()) => {
+                    captured(p, w, h, px, false);
                     DestroyWindow(hwnd);
                 }
                 Err(e) => util::message_box(hwnd, &format!("Could not save {}:\n{e}", path.display()), MB_ICONERROR),
             }
+        }
+        Action::Pin => {
+            let Some((w, h, px)) = (*p).editor.final_image() else { return };
+            // Pin even if another app holds the clipboard.
+            clipboard::set_image(hwnd, w, h, &px);
+            captured(p, w, h, px, true);
+            DestroyWindow(hwnd);
         }
         Action::Gif => {
             if let Some(req) = (*p).editor.gif_request() {
@@ -356,7 +373,17 @@ unsafe fn perform(hwnd: HWND, p: *mut Shell, action: Action) {
     }
 }
 
-unsafe fn save_dialog(owner: HWND) -> Option<PathBuf> {
+/// Hands a finished capture to the main window: it goes into the history and,
+/// with `pin`, onto the screen where it was taken (or into the pin being
+/// edited).
+unsafe fn captured(p: *mut Shell, w: i32, h: i32, pixels: Vec<u8>, pin: bool) {
+    let at = (*p).editor.selection_on_screen().map_or((0, 0), |r| (r.l, r.t));
+    let layers = (*p).editor.layers().map(|(_, _, base, shapes)| (base, shapes));
+    let c = Box::new(Captured { w, h, pixels, layers, at, pin, replace: (*p).edit_target });
+    PostMessageW((*p).main, WM_APP_CAPTURED, 0, Box::into_raw(c) as LPARAM);
+}
+
+pub(super) unsafe fn save_dialog(owner: HWND) -> Option<PathBuf> {
     let dir = SAVE_DIR.with(|d| d.borrow().clone()).unwrap_or_else(util::pictures_dir);
     let name = format!("Screenshot_{}.png", util::timestamp());
     let mut file = [0u16; 1024];

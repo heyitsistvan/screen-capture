@@ -1,16 +1,20 @@
 //! Screen Capture — a Lightshot-style screenshot tool for Windows and Linux.
 //!
 //! PrtSc opens an overlay to select an area, annotate it and copy/save it.
-//! Shift+PrtSc (or the overlay's GIF button) records the area as an animated
-//! GIF; PrtSc again stops. The app lives in the notification area / tray.
+//! Ctrl+PrtSc (or the overlay's Pin button) keeps the result on screen in a
+//! floating window, to compare captures. Shift+PrtSc (or the GIF button)
+//! records the area as an animated GIF; PrtSc again stops. The app lives in
+//! the notification area / tray, with recent captures in its menu.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod annotate;
 mod editor;
 mod gif_enc;
+mod history;
 mod icon;
 mod ocr;
+mod pin;
 mod recbar;
 #[cfg(debug_assertions)]
 mod selftest;

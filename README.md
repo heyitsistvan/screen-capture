@@ -1,8 +1,8 @@
 # Screen Capture
 
 A Lightshot-style screenshot tool for Windows and Linux, written in Rust. Press **PrtSc**,
-select an area, draw on it, copy it. Press **Shift+PrtSc** to record the area as an animated
-GIF.
+select an area, draw on it, copy it. Press **Ctrl+PrtSc** to keep the capture floating on screen,
+to compare it with what changes. Press **Shift+PrtSc** to record the area as an animated GIF.
 
 A single executable (about 1 MB on Windows) that lives in the notification area / system tray.
 
@@ -41,11 +41,12 @@ At runtime it needs `libpipewire-0.3` (present on any current desktop). Optional
 | Key / action | What it does |
 |---|---|
 | **PrtSc** | Open the capture overlay |
+| **Ctrl+PrtSc** | The same, but finishing pins the capture on screen (see [Pinned captures](#pinned-captures)) |
 | **Shift+PrtSc** | Record a GIF: select an area (or click a window) and recording starts immediately |
 | **PrtSc** while recording | Stop and save the GIF |
 | Tray icon click | Capture; right-click for the menu |
 
-On Windows, Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep working.
+On Windows, Alt/Win+PrtSc are left alone, so the Windows built-ins keep working.
 
 ### In the overlay
 
@@ -81,9 +82,34 @@ On Windows, Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep wor
   Text the OCR misses gets ordinary pixelation; if OCR isn't available at all, the area becomes
   a mosaic of its colors instead. The result is frozen when you draw it, so in GIFs nothing
   typed behind it shows.
-- **Ctrl+C**, **Enter** or **double-click** copies the image to the clipboard and closes.
-  **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** records the selection as a GIF.
+- **Ctrl+C**, **Enter** or **double-click** copies the image to the clipboard and closes (in
+  Ctrl+PrtSc mode they also pin it). **Ctrl+P** or the pin button copies it and pins it on
+  screen. **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** records the selection as a GIF.
   **Esc** closes. **Right-click** steps back (cancels tool, then selection, then closes).
+
+### Pinned captures
+
+A pinned capture floats above other windows, exactly where it was taken, so you can compare it
+with the screen as it changes (or with another pin):
+
+- Hovering it shows a small **toolbar**: the zoom (when it isn't 100%; click to go back),
+  **opacity** (cycles 100, 80, 60, 40%), **copy**, **save**, **edit** and **×** to close.
+- **Edit** (the pencil, or **Ctrl+E**) reopens it in the editor right where it is, with every
+  tool. Drawings you made before can still be moved or deleted. Finishing (Enter, Ctrl+C, the pin
+  button) updates the pin, keeping its place, zoom and opacity; Esc leaves it as it was.
+- **Drag** it anywhere; **drag an edge or corner** to resize it (the picture keeps its
+  proportions). The **arrow keys** nudge it by a pixel (Shift = 10 px) to line it up.
+- **Mouse wheel** zooms (10–800%, around the cursor); **Ctrl+0** goes back to 100%.
+- **Ctrl+wheel** changes its opacity: lower it and lay the old capture over the live screen to see
+  what moved.
+- **Ctrl+C** copies it, **Ctrl+S** saves it, **Esc** or **double-click** closes it. On Windows,
+  **right-click** opens a menu with these, edit, opacity presets and "Close all pins"; on Linux it
+  shows the controls again.
+- Pins hide while you take a new capture, so they don't end up in it. (GIF recordings show them.)
+
+**Recent captures** in the tray menu lists the last 10 captures (copied, saved or pinned) with
+thumbnails; click one to pin it again. The history is kept in memory only: it's gone when the app
+exits, and "Clear history" empties it right away.
 
 ### GIFs
 
@@ -102,12 +128,13 @@ On Windows, Alt/Ctrl/Win+PrtSc are left alone, so the Windows built-ins keep wor
 
 ### Tray menu
 
-Capture, Record GIF, GIF frame rate, cursor in GIFs, open the GIF folder, **Start with Windows** /
+Capture, Capture and pin, Record GIF, Recent captures, Close all pins (when there are any), GIF
+frame rate, cursor in GIFs, open the GIF folder, **Start with Windows** /
 **Start at login** (registers the executable's current path; move it to its final location
 first), About (version, links to Pixobit Solutions and the source code), Exit.
 
-Command line: `screen-capture --capture` or `--gif` triggers a capture in the running instance
-(handy for binding to another key or a shortcut). Like PrtSc, `--capture` during a recording
+Command line: `screen-capture --capture`, `--pin` or `--gif` triggers a capture in the running
+instance (handy for binding to another key or a shortcut). Like PrtSc, `--capture` during a recording
 stops it; on Linux, `--stop` does only that.
 
 Settings: `%APPDATA%\screen-capture\settings.ini` on Windows,
@@ -120,7 +147,9 @@ Everything above works the same on X11 and Wayland, with these differences.
 **X11**: PrtSc is grabbed directly. Many desktops already bind PrtSc to their own screenshot tool
 (GNOME, KDE, XFCE, Cinnamon, openbox's default config…); then the app says so on startup, and you
 can free the key or bind another one in the desktop's keyboard settings to
-`screen-capture --capture` (and Shift+PrtSc to `screen-capture --gif`).
+`screen-capture --capture` (and Ctrl+PrtSc to `screen-capture --pin`, Shift+PrtSc to
+`screen-capture --gif`). Pins stay on top, and Ctrl+wheel opacity works with a compositing window
+manager (GNOME, KDE, XFCE with compositing, picom…).
 
 **Wayland** doesn't let apps read the screen or grab keys directly, so the app goes through the
 desktop portals (`xdg-desktop-portal` plus your desktop's backend):
@@ -133,6 +162,7 @@ desktop portals (`xdg-desktop-portal` plus your desktop's backend):
 
   ```
   bindsym Print exec screen-capture --capture
+  bindsym Ctrl+Print exec screen-capture --pin
   bindsym Shift+Print exec screen-capture --gif
   ```
 
@@ -141,6 +171,10 @@ desktop portals (`xdg-desktop-portal` plus your desktop's backend):
 - Wayland doesn't tell apps where windows are, so **a click selects the whole screen** instead of
   a window. The overlay covers one monitor (the primary one), and the recording bar is placed by
   the compositor (drag it aside if needed); there's no red frame around the recorded area.
+- **Pins** can be dragged, zoomed, copied and saved, but Wayland leaves the rest to the
+  compositor: they don't stay above other windows, don't open exactly where the capture was,
+  can't change opacity or be nudged with the arrow keys, and can't hide while you take a new
+  capture (drag them aside or close them first).
 - wlroots compositors (sway, Hyprland, river, …) need `xdg-desktop-portal-wlr` (or
   `xdg-desktop-portal-hyprland`) **and** `xdg-desktop-portal-gtk`: the Screenshot portal only
   works when a backend for its permission dialog is installed too.
@@ -148,7 +182,8 @@ desktop portals (`xdg-desktop-portal` plus your desktop's backend):
 ## Development
 
 Debug builds include a non-interactive self-test that captures the screen, renders the overlay
-offscreen, checks text editing, drawing, outlines and pixelate (including an attack that tries to
+offscreen, checks text editing, drawing, pin mode, pin zoom and opacity (on Windows with a real,
+off-screen pin window), the history, outlines and pixelate (including an attack that tries to
 read pixelated passwords back), encodes and re-decodes GIFs, and writes the results to a folder:
 
 ```sh
@@ -169,9 +204,11 @@ Linux debug builds also have `--dump-screen <file.png>` (save the X screen), `--
 | `ocr.rs` | Shared OCR preparation and word/line merging for pixelate |
 | `gif_enc.rs` | GIF encoder (frame diffing, quantization, parallel LZW) |
 | `recbar.rs` | The recording bar, drawn the same on both platforms |
+| `pin.rs` | A pinned capture's zoom, opacity, labels and drawing; each platform's window feeds it input |
+| `history.rs` | The last 10 captures, compressed in memory, for the tray menu |
 | `text.rs`, `ui.rs`, `icon.rs` | Font rendering, UI drawing and icons, app icon |
-| `win/` | Windows: tray, PrtSc keyboard hook, overlay window, GDI capture, clipboard, WinRT OCR, recording |
-| `linux/` | Linux: tray (StatusNotifierItem), X11 key grab and capture, portals, PipeWire recording, Tesseract OCR, dialogs |
+| `win/` | Windows: tray, PrtSc keyboard hook, overlay and pin windows, GDI capture, clipboard, WinRT OCR, recording |
+| `linux/` | Linux: tray (StatusNotifierItem), X11 key grab and capture, portals, pin windows, PipeWire recording, Tesseract OCR, dialogs |
 
 ## About
 

@@ -41,6 +41,66 @@ pub fn encode_png(w: i32, h: i32, bgra: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Decodes a PNG into opaque BGRA `(w, h, pixels)`.
+pub fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u8>), String> {
+    let mut dec = png::Decoder::new(data);
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Indexed => return Err("unexpected palette PNG".into()),
+    };
+    let px = buf[..info.buffer_size()]
+        .chunks_exact(channels)
+        .flat_map(|p| if channels < 3 { [p[0], p[0], p[0], 255] } else { [p[2], p[1], p[0], 255] })
+        .collect();
+    Ok((info.width as i32, info.height as i32, px))
+}
+
+/// Resizes BGRA pixels to `dw` × `dh`: averages the covered pixels when
+/// shrinking, repeats them (crisp, no smoothing) when enlarging.
+pub fn resize(src: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw.max(1) as usize, sh.max(1) as usize, dw.max(1) as usize, dh.max(1) as usize);
+    let mut out = vec![255u8; dw * dh * 4];
+    for y in 0..dh {
+        let (y0, y1) = (y * sh / dh, ((y + 1) * sh).div_ceil(dh).max(y * sh / dh + 1).min(sh));
+        for x in 0..dw {
+            let (x0, x1) = (x * sw / dw, ((x + 1) * sw).div_ceil(dw).max(x * sw / dw + 1).min(sw));
+            let mut sum = [0u32; 3];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy * sw + sx) * 4;
+                    sum[0] += src[i] as u32;
+                    sum[1] += src[i + 1] as u32;
+                    sum[2] += src[i + 2] as u32;
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let o = (y * dw + x) * 4;
+            out[o..o + 3].copy_from_slice(&[(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8]);
+        }
+    }
+    out
+}
+
+/// The largest size with the same aspect ratio as `w` × `h` that fits in
+/// `max_w` × `max_h` (never enlarged, at least 1 × 1).
+pub fn fit(w: i32, h: i32, max_w: i32, max_h: i32) -> (i32, i32) {
+    let s = (max_w as f32 / w.max(1) as f32).min(max_h as f32 / h.max(1) as f32).min(1.0);
+    (((w as f32 * s).round() as i32).max(1), ((h as f32 * s).round() as i32).max(1))
+}
+
+/// `HH:MM:SS` in local time.
+pub fn clock() -> String {
+    // timestamp() is `YYYY-MM-DD_HH-MM-SS`.
+    timestamp()[11..].replace('-', ":")
+}
+
 /// Integer rectangle with exclusive right/bottom edges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {

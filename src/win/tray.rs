@@ -5,7 +5,7 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{HWND, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS,
+    DIB_RGB_COLORS, HBITMAP,
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_NOSOUND,
@@ -62,6 +62,32 @@ pub fn balloon(hwnd: HWND, title: &str, text: &str, error: bool) {
 pub fn remove(hwnd: HWND) {
     let nid = base(hwnd);
     unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+}
+
+/// An opaque 32-bit bitmap of BGRA pixels, for menu thumbnails. The caller
+/// deletes it (`DeleteObject`) once the menu is gone.
+pub fn make_bitmap(w: i32, h: i32, bgra: &[u8]) -> HBITMAP {
+    unsafe {
+        let mut bi: BITMAPINFO = std::mem::zeroed();
+        bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        let hdc = GetDC(null_mut());
+        let mut bits = null_mut();
+        let bmp = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        ReleaseDC(null_mut(), hdc);
+        if bmp.is_null() || bits.is_null() {
+            return null_mut();
+        }
+        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, w as usize * h as usize * 4);
+        for (d, s) in dst.chunks_exact_mut(4).zip(bgra.chunks_exact(4)) {
+            d.copy_from_slice(&[s[0], s[1], s[2], 255]);
+        }
+        bmp
+    }
 }
 
 /// Builds an HICON from the drawn app icon.

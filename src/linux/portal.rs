@@ -13,6 +13,8 @@ use futures_util::StreamExt;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
+use crate::editor::Mode;
+
 pub fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -35,37 +37,18 @@ pub async fn screenshot() -> Result<(i32, i32, Vec<u8>), String> {
     let data = std::fs::read(&path).map_err(err)?;
     // The portal saved it for us alone; don't leave copies around.
     let _ = std::fs::remove_file(&path);
-    decode_png(&data)
+    crate::util::decode_png(&data)
 }
 
-fn decode_png(data: &[u8]) -> Result<(i32, i32, Vec<u8>), String> {
-    let mut dec = png::Decoder::new(data);
-    dec.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = dec.read_info().map_err(err)?;
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).map_err(err)?;
-    let channels = match info.color_type {
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Indexed => return Err("unexpected palette PNG".into()),
-    };
-    let px = buf[..info.buffer_size()]
-        .chunks_exact(channels)
-        .flat_map(|p| if channels < 3 { [p[0], p[0], p[0], 255] } else { [p[2], p[1], p[0], 255] })
-        .collect();
-    Ok((info.width as i32, info.height as i32, px))
-}
-
-/// Binds PrtSc and Shift+PrtSc through the GlobalShortcuts portal and calls
-/// `on_press(gif, activation_token)` for each press. Runs as long as the
-/// shortcuts stay bound.
-pub async fn global_shortcuts(on_press: impl Fn(bool, Option<String>) + Send + 'static) -> Result<(), String> {
+/// Binds PrtSc, Ctrl+PrtSc and Shift+PrtSc through the GlobalShortcuts
+/// portal and calls `on_press(mode, activation_token)` for each press. Runs
+/// as long as the shortcuts stay bound.
+pub async fn global_shortcuts(on_press: impl Fn(Mode, Option<String>) + Send + 'static) -> Result<(), String> {
     let portal = GlobalShortcuts::new().await.map_err(err)?;
     let session = portal.create_session().await.map_err(err)?;
     let shortcuts = [
         NewShortcut::new("capture", "Capture an area").preferred_trigger("Print"),
+        NewShortcut::new("pin", "Capture an area and pin it on screen").preferred_trigger("<Control>Print"),
         NewShortcut::new("gif", "Record an area as a GIF").preferred_trigger("<Shift>Print"),
     ];
     portal.bind_shortcuts(&session, &shortcuts, None).await.map_err(err)?.response().map_err(err)?;
@@ -73,7 +56,12 @@ pub async fn global_shortcuts(on_press: impl Fn(bool, Option<String>) + Send + '
     while let Some(press) = presses.next().await {
         // Lets the compositor give our window focus (xdg-activation).
         let token = press.options().get("activation_token").and_then(|v| v.downcast_ref::<String>().ok());
-        on_press(press.shortcut_id() == "gif", token);
+        let mode = match press.shortcut_id() {
+            "gif" => Mode::Gif,
+            "pin" => Mode::Pin,
+            _ => Mode::Capture,
+        };
+        on_press(mode, token);
     }
     drop(session);
     Ok(())

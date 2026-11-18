@@ -80,6 +80,24 @@ pub struct Screen {
     pub origin: (i32, i32),
 }
 
+impl Screen {
+    /// Draws an image into the screenshot with its top-left corner at screen
+    /// position `at` (moved inside if it would stick out); returns where it
+    /// went, in screenshot coordinates.
+    pub fn place(&mut self, at: (i32, i32), w: i32, h: i32, pixels: &[u8]) -> Rect {
+        let x = (at.0 - self.origin.0).clamp(0, (self.w - w).max(0));
+        let y = (at.1 - self.origin.1).clamp(0, (self.h - h).max(0));
+        let r = Rect::xywh(x, y, w, h).intersect(&Rect::new(0, 0, self.w, self.h));
+        let n = r.w() as usize * 4;
+        for row in 0..r.h() {
+            let s = (row * w) as usize * 4;
+            let d = (((r.t + row) * self.w + r.l) * 4) as usize;
+            self.pixels[d..d + n].copy_from_slice(&pixels[s..s + n]);
+        }
+        r
+    }
+}
+
 /// What the editor hands over when the user starts a GIF recording.
 pub struct GifRequest {
     /// Area to record, in screen coordinates.
@@ -216,6 +234,7 @@ enum Btn {
     Undo,
     Redo,
     Gif,
+    Pin,
     Copy,
     Save,
     Close,
@@ -232,6 +251,7 @@ impl Btn {
             Btn::Undo => "Undo (Ctrl+Z)",
             Btn::Redo => "Redo (Ctrl+Y)",
             Btn::Gif => "Record GIF of this area (G)",
+            Btn::Pin => "Pin to the screen, to compare (Ctrl+P)",
             Btn::Copy => "Copy to clipboard (Ctrl+C)",
             Btn::Save => "Save as PNG (Ctrl+S)",
             Btn::Close => "Close (Esc)",
@@ -251,6 +271,7 @@ impl Btn {
             Btn::Undo => Icon::Undo,
             Btn::Redo => Icon::Redo,
             Btn::Gif => Icon::Gif,
+            Btn::Pin => Icon::Pin,
             Btn::Copy => Icon::Copy,
             Btn::Save => Icon::Save,
             Btn::Close => Icon::Close,
@@ -305,12 +326,25 @@ struct TextEdit {
     original: Option<(usize, Shape)>,
 }
 
+/// What a capture is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Select an area to copy, save or pin (PrtSc).
+    Capture,
+    /// The same, but finishing pins the area to the screen (Ctrl+PrtSc).
+    Pin,
+    /// Select an area to record (Shift+PrtSc).
+    Gif,
+}
+
 /// Things the window shell does after an input handler returns, because they
 /// run modal dialogs, touch the clipboard or close the window.
 pub enum Action {
     Close,
     Copy,
     Save,
+    /// Copy the image and keep it on screen in a floating window.
+    Pin,
     Gif,
     ChooseColor,
     ChooseOutlineColor,
@@ -339,6 +373,8 @@ enum Part {
 pub struct Editor {
     host: Box<dyn Host>,
     gif_mode: bool,
+    /// Finishing (Enter, double-click, Ctrl+C) pins instead of just copying.
+    pin_mode: bool,
     /// Screen position of the window's (0, 0).
     ox: i32,
     oy: i32,
@@ -406,7 +442,7 @@ fn same_text(a: &Shape, b: &Shape) -> bool {
 }
 
 impl Editor {
-    pub fn new(host: Box<dyn Host>, screen: Screen, fonts: Arc<Fonts>, gif_mode: bool, scale: f32) -> Box<Editor> {
+    pub fn new(host: Box<dyn Host>, screen: Screen, fonts: Arc<Fonts>, mode: Mode, scale: f32) -> Box<Editor> {
         let Screen { w, h, pixels: shot, monitors, windows, mouse, origin } = screen;
         let mut dim = shot.clone();
         for p in dim.chunks_exact_mut(4) {
@@ -416,7 +452,8 @@ impl Editor {
         }
         let mut ed = Box::new(Editor {
             host,
-            gif_mode,
+            gif_mode: mode == Mode::Gif,
+            pin_mode: mode == Mode::Pin,
             ox: origin.0,
             oy: origin.1,
             w,
@@ -612,8 +649,9 @@ impl Editor {
         let vy = (sel.b - vh).min(mon.b - vh).max(mon.t);
         let vbar = Rect::xywh(vx, vy, vw, vh);
 
-        let hitems = [Some(Btn::Gif), None, Some(Btn::Copy), Some(Btn::Save), None, Some(Btn::Close)];
-        let (hw, hh) = (2 * p + 4 * b + 2 * sep, b + 2 * p);
+        let hitems = [Some(Btn::Gif), None, Some(Btn::Pin), Some(Btn::Copy), Some(Btn::Save), None, Some(Btn::Close)];
+        let hb = hitems.iter().filter(|i| i.is_some()).count() as i32;
+        let (hw, hh) = (2 * p + hb * b + (hitems.len() as i32 - hb) * sep, b + 2 * p);
         let hy = if sel.b + gap + hh <= mon.b {
             sel.b + gap
         } else if sel.t - gap - hh >= mon.t {
@@ -749,13 +787,17 @@ impl Editor {
             return None;
         }
         // Without window positions (Wayland), a click selects the screen.
-        let text = match (self.gif_mode, self.windows.is_empty()) {
-            (true, false) => "Record GIF: drag to select an area, or click a window   ·   Esc to cancel",
-            (true, true) => "Record GIF: drag to select an area, or click for the whole screen   ·   Esc to cancel",
-            (false, false) => {
+        let text = match (self.gif_mode, self.pin_mode, self.windows.is_empty()) {
+            (true, _, false) => "Record GIF: drag to select an area, or click a window   ·   Esc to cancel",
+            (true, _, true) => "Record GIF: drag to select an area, or click for the whole screen   ·   Esc to cancel",
+            (false, true, false) => "Pin to the screen: drag to select an area, or click a window   ·   Esc to cancel",
+            (false, true, true) => {
+                "Pin to the screen: drag to select an area, or click for the whole screen   ·   Esc to cancel"
+            }
+            (false, false, false) => {
                 "Drag to select an area, or click a window   ·   C copies the color under the cursor   ·   Esc to cancel"
             }
-            (false, true) => {
+            (false, false, true) => {
                 "Drag to select an area, or click for the whole screen   ·   C copies the color under the cursor   ·   Esc to cancel"
             }
         };
@@ -1484,6 +1526,46 @@ impl Editor {
         Some((sel.w(), sel.h(), self.committed.clone()))
     }
 
+    /// The selection as layers: its pixels without drawings, and the drawings
+    /// relative to its top-left corner (so a pin can be edited again).
+    pub fn layers(&mut self) -> Option<(i32, i32, Vec<u8>, Vec<Shape>)> {
+        self.commit_edit();
+        self.current = None;
+        let sel = self.sel?;
+        let mut base = Vec::with_capacity(sel.w() as usize * sel.h() as usize * 4);
+        for y in sel.t..sel.b {
+            let i = ((y * self.w + sel.l) * 4) as usize;
+            base.extend_from_slice(&self.shot[i..i + sel.w() as usize * 4]);
+        }
+        let mut shapes = self.shapes.clone();
+        for s in &mut shapes {
+            s.translate(-(sel.l as f32), -(sel.t as f32));
+        }
+        Some((sel.w(), sel.h(), base, shapes))
+    }
+
+    /// Starts with `sel` selected and `shapes` (relative to its top-left
+    /// corner) drawn on it, e.g. to edit a pinned capture again.
+    pub fn preset(&mut self, sel: Rect, shapes: Vec<Shape>) {
+        let sel = sel.intersect(&self.bounds());
+        if sel.is_empty() {
+            return;
+        }
+        self.shapes = shapes;
+        for s in &mut self.shapes {
+            s.translate(sel.l as f32, sel.t as f32);
+        }
+        self.set_sel(Some(sel));
+        self.committed_ok = false;
+        self.comp_ok = false;
+        self.invalidate();
+    }
+
+    /// The selected area in screen coordinates (where a pin of it goes).
+    pub fn selection_on_screen(&self) -> Option<Rect> {
+        self.sel.map(|s| s.offset(self.ox, self.oy))
+    }
+
     pub fn gif_request(&mut self) -> Option<GifRequest> {
         self.commit_edit();
         let sel = self.sel?;
@@ -1626,7 +1708,7 @@ impl Editor {
             && self.shape_at(x, y).is_none()
             && self.sel.is_some_and(|s| s.contains(x, y))
         {
-            return Some(Action::Copy);
+            return Some(self.finish());
         }
         if let Some(b) = self.hit_button(x, y) {
             self.drag = Drag::Button(b);
@@ -1769,9 +1851,19 @@ impl Editor {
                 None
             }
             Btn::Gif => Some(Action::Gif),
+            Btn::Pin => Some(Action::Pin),
             Btn::Copy => Some(Action::Copy),
             Btn::Save => Some(Action::Save),
             Btn::Close => Some(Action::Close),
+        }
+    }
+
+    /// Enter, double-click or Ctrl+C: copy, and in pin mode also pin.
+    fn finish(&self) -> Action {
+        if self.pin_mode {
+            Action::Pin
+        } else {
+            Action::Copy
         }
     }
 
@@ -1860,7 +1952,7 @@ impl Editor {
                     }
                 }
                 _ if ctrl && vk == b'Z' as u16 => self.undo(),
-                _ if ctrl && (vk == b'C' as u16 || vk == b'S' as u16) => {
+                _ if ctrl && (vk == b'C' as u16 || vk == b'S' as u16 || vk == b'P' as u16) => {
                     self.commit_edit();
                     return self.on_key(vk, mods);
                 }
@@ -1881,7 +1973,7 @@ impl Editor {
                     return Some(Action::Close);
                 }
             }
-            key::ENTER if self.sel.is_some() => action = Some(Action::Copy),
+            key::ENTER if self.sel.is_some() => action = Some(self.finish()),
             key::LEFT | key::RIGHT | key::UP | key::DOWN => {
                 if let (Some(s), Drag::None) = (self.sel, self.drag) {
                     let step = if shift { 10 } else { 1 };
@@ -1914,8 +2006,9 @@ impl Editor {
             _ if ctrl => {
                 let key = vk as u8;
                 match key {
-                    b'C' if self.sel.is_some() => action = Some(Action::Copy),
+                    b'C' if self.sel.is_some() => action = Some(self.finish()),
                     b'S' if self.sel.is_some() => action = Some(Action::Save),
+                    b'P' if self.sel.is_some() && !self.gif_mode => action = Some(Action::Pin),
                     b'Z' if shift => self.redo(),
                     b'Z' => self.undo(),
                     b'Y' => self.redo(),
@@ -1967,7 +2060,7 @@ impl Editor {
 #[cfg(debug_assertions)]
 pub fn text_editing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     let (w, h) = (800, 500);
-    let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, vec![255u8; (w * h * 4) as usize]), fonts, false, 1.0);
+    let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, vec![255u8; (w * h * 4) as usize]), fonts, Mode::Capture, 1.0);
     ov.sel = Some(Rect::new(50, 50, 750, 450));
     let text = |ov: &Editor| match ov.shapes.first() {
         Some(Shape::Text { pos, text, .. }) => Ok((*pos, text.clone())),
@@ -2032,7 +2125,7 @@ pub fn drawing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     let mut shot = vec![255u8; (w * h * 4) as usize];
     let k = ((400 * w + 700) * 4) as usize;
     shot[k..k + 4].copy_from_slice(&[0xFF, 0x90, 0x1E, 255]); // #1E90FF at (700, 400)
-    let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, shot), fonts, false, 1.0);
+    let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, shot), fonts, Mode::Capture, 1.0);
     ov.sel = Some(Rect::new(50, 50, 750, 450));
     let check = |ok: bool, what: &str| if ok { Ok(()) } else { Err(what.to_string()) };
     let steps = |ov: &Editor| -> Vec<(u32, Pt)> {
@@ -2104,10 +2197,60 @@ pub fn drawing_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     Ok("steps 1-2-3, drag while placing, move arrow/rect, delete + undo, color #1E90FF".into())
 }
 
+/// What finishing a capture does in each mode, and the Pin button (debug
+/// self-test).
+#[cfg(debug_assertions)]
+pub fn pin_mode_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
+    let (w, h) = (800, 500);
+    let editor = |mode| {
+        let mut ov = Editor::new(Box::new(NullHost), test_screen(w, h, vec![255u8; (w * h * 4) as usize]), fonts.clone(), mode, 1.0);
+        ov.sel = Some(Rect::new(100, 100, 400, 300));
+        ov
+    };
+    let check = |ok: bool, what: &str| if ok { Ok(()) } else { Err(what.to_string()) };
+    let ctrl = Mods { ctrl: true, shift: false };
+
+    let mut ov = editor(Mode::Capture);
+    check(matches!(ov.on_key(key::ENTER, Mods::default()), Some(Action::Copy)), "Enter didn't copy")?;
+    check(matches!(ov.on_key(b'P' as u16, ctrl), Some(Action::Pin)), "Ctrl+P didn't pin")?;
+    let pin = ov.layout().and_then(|l| l.buttons.iter().find(|b| b.0 == Btn::Pin).map(|b| b.1));
+    let Some(pin) = pin else { return Err("no Pin button next to Copy".into()) };
+    let (cx, cy) = pin.center();
+    ov.on_down(cx, cy, false);
+    check(matches!(ov.on_up(cx, cy), Some(Action::Pin)), "the Pin button didn't pin")?;
+    ov.ox = -1920;
+    ov.oy = 40;
+    check(ov.selection_on_screen() == Some(Rect::new(-1820, 140, -1520, 340)), "selection not in screen coordinates")?;
+
+    let mut ov = editor(Mode::Pin);
+    check(matches!(ov.on_key(key::ENTER, Mods::default()), Some(Action::Pin)), "Enter didn't pin in pin mode")?;
+    check(matches!(ov.on_key(b'C' as u16, ctrl), Some(Action::Pin)), "Ctrl+C didn't pin in pin mode")?;
+    check(matches!(ov.on_down(250, 200, true), Some(Action::Pin)), "double-click didn't pin in pin mode")?;
+
+    let mut ov = editor(Mode::Gif);
+    check(ov.on_key(b'P' as u16, ctrl).is_none(), "Ctrl+P pinned in GIF mode")?;
+
+    // Editing a pin again: its picture goes back on the screenshot, the
+    // selection and drawings are restored, and the layers come back the same.
+    let mut screen = test_screen(w, h, vec![255u8; (w * h * 4) as usize]);
+    let (pw, ph) = (200, 150);
+    let picture: Vec<u8> = (0..pw * ph).flat_map(|i| [(i % 256) as u8, 40, 90, 255]).collect();
+    let at = screen.place((750, 420), pw, ph, &picture);
+    check(at == Rect::new(600, 350, 800, 500), "a picture sticking out wasn't moved inside")?;
+    let mut ov = Editor::new(Box::new(NullHost), screen, fonts.clone(), Mode::Pin, 1.0);
+    let shapes = vec![Shape::Rect { a: (10.5, 10.5), b: (50.5, 40.5), color: PALETTE[0], width: 3.0, outline: None }];
+    ov.preset(at, shapes.clone());
+    let (lw, lh, base, back) = ov.layers().ok_or("no selection after preset")?;
+    check((lw, lh) == (pw, ph) && base == picture, "the picture didn't come back unchanged")?;
+    check(format!("{back:?}") == format!("{shapes:?}"), "the drawings didn't come back unchanged")?;
+    check(matches!(ov.on_key(key::ENTER, Mods::default()), Some(Action::Pin)), "Enter didn't finish the edit")?;
+    Ok("Enter copies, Ctrl+P and the Pin button pin; pin mode pins; editing a pin restores picture and drawings".into())
+}
+
 /// Renders the overlay into a PNG without showing a window (debug self-test).
 #[cfg(debug_assertions)]
 pub fn render_preview(fonts: Arc<Fonts>, screen: Screen, out: &std::path::Path) -> Result<(), String> {
-    let mut ov = Editor::new(Box::new(NullHost), screen, fonts, false, 1.0);
+    let mut ov = Editor::new(Box::new(NullHost), screen, fonts, Mode::Capture, 1.0);
     let mon = ov.monitors.first().copied().unwrap_or(ov.bounds());
     let sel = Rect::xywh(mon.l + mon.w() / 4, mon.t + mon.h() / 4, mon.w() / 2, mon.h() / 2);
     ov.sel = Some(sel);

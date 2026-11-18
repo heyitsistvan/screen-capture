@@ -18,7 +18,7 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{ActivationToken, CursorIcon, Fullscreen, Window};
 
-use crate::editor::{key, Action, Cursor, Editor, Host, Mods, Screen};
+use crate::editor::{key, Action, Cursor, Editor, Host, Mode, Mods, Screen};
 use crate::text::Fonts;
 use crate::util::{Rect, APP_NAME};
 
@@ -97,7 +97,7 @@ impl EditorWindow {
         screen: Screen,
         monitor: Option<MonitorHandle>,
         fonts: Arc<Fonts>,
-        gif_mode: bool,
+        mode: Mode,
         activation: Option<String>,
     ) -> Result<EditorWindow, String> {
         let mut attrs = Window::default_attributes()
@@ -115,7 +115,7 @@ impl EditorWindow {
         let host = Rc::new(RefCell::new(HostState::default()));
         let (w, h) = (screen.w, screen.h);
         let scale = window.scale_factor() as f32;
-        let editor = Editor::new(Box::new(LinuxHost(host.clone())), screen, fonts, gif_mode, scale);
+        let editor = Editor::new(Box::new(LinuxHost(host.clone())), screen, fonts, mode, scale);
         window.focus_window();
         window.request_redraw();
         Ok(EditorWindow {

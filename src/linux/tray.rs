@@ -16,6 +16,9 @@ pub struct TrayModel {
     pub fps: u32,
     pub cursor: bool,
     pub autostart: bool,
+    /// Recent captures, newest first: (history id, label, thumbnail PNG).
+    pub history: Vec<(u64, String, Vec<u8>)>,
+    pub pins: usize,
 }
 
 impl TrayModel {
@@ -71,6 +74,26 @@ impl Tray for TrayModel {
             .into()
         };
         let fps = FPS_CHOICES.iter().map(|&f| check(&format!("{f} fps"), f == self.fps, Cmd::SetFps(f))).collect();
+        let recent: MenuItem<Self> = if self.history.is_empty() {
+            StandardItem { label: "Recent captures".into(), enabled: false, ..Default::default() }.into()
+        } else {
+            let mut items: Vec<MenuItem<Self>> = self
+                .history
+                .iter()
+                .map(|(id, label, thumb)| {
+                    let id = *id;
+                    StandardItem {
+                        label: label.clone(),
+                        icon_data: thumb.clone(),
+                        activate: Box::new(move |t: &mut Self| t.send(Cmd::PinHistory(id))),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect();
+            items.extend([MenuItem::Separator, item("Clear history", Cmd::ClearHistory)]);
+            SubMenu { label: "Recent captures".into(), submenu: items, ..Default::default() }.into()
+        };
         let about = vec![
             StandardItem { label: format!("{APP_NAME} {VERSION}"), enabled: false, ..Default::default() }.into(),
             item(&format!("Made by {MAKER} (pixobit.eu)"), Cmd::OpenUrl(HOMEPAGE)),
@@ -78,11 +101,21 @@ impl Tray for TrayModel {
         ];
         vec![
             item("Capture area (PrtSc)", Cmd::Capture),
+            item("Capture and pin (Ctrl+PrtSc)", Cmd::Pin),
             if self.recording {
                 item("Stop GIF recording (PrtSc)", Cmd::Stop)
             } else {
                 item("Record GIF (Shift+PrtSc)", Cmd::Gif)
             },
+            MenuItem::Separator,
+            recent,
+            StandardItem {
+                label: if self.pins == 1 { "Close the pin".into() } else { format!("Close all {} pins", self.pins) },
+                visible: self.pins > 0,
+                activate: Box::new(|t: &mut Self| t.send(Cmd::ClosePins)),
+                ..Default::default()
+            }
+            .into(),
             MenuItem::Separator,
             SubMenu { label: "GIF frame rate".into(), submenu: fps, ..Default::default() }.into(),
             check("Show mouse cursor in GIFs", self.cursor, Cmd::ToggleCursor),

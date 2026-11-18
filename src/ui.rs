@@ -181,6 +181,12 @@ impl<'a> Canvas<'a> {
                 let top = cy + px * 0.35 - ascent;
                 self.text(cx - tw / 2.0, top, "GIF", px, c, &fonts.bold);
             }
+            Icon::Pin => {
+                // A pushpin: head, collar, needle.
+                let head = [(9.5, 4.0), (14.5, 4.0), (14.0, 10.0), (17.0, 13.5), (7.0, 13.5), (10.0, 10.0)];
+                self.stroke_path(poly(&head, true), c, sw, tf);
+                self.stroke_path(poly(&[(12.0, 13.5), (12.0, 20.0)], false), c, sw, tf);
+            }
             Icon::Copy => {
                 self.stroke_path(rrect_path(8.5, 8.5, 11.0, 11.0, 2.0), c, sw, tf);
                 let mut pb = PathBuilder::new();
@@ -222,6 +228,7 @@ pub enum Icon {
     Undo,
     Redo,
     Gif,
+    Pin,
     Copy,
     Save,
     Close,

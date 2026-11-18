@@ -69,6 +69,11 @@ pub fn run(dir: &Path, photos: Option<&Path>) -> i32 {
 
     check("text editing", editor::text_editing_selftest(fonts.clone()));
     check("drawing", editor::drawing_selftest(fonts.clone()));
+    check("pin mode", editor::pin_mode_selftest(fonts.clone()));
+    check("pin view", crate::pin::selftest(&fonts, &dir.join("pin.png")));
+    #[cfg(windows)]
+    check("pin window", crate::win::pin::selftest(fonts.clone()));
+    check("history", crate::history::selftest());
 
     check("outlines", {
         // Every palette color as arrow + text, on a light and a dark panel,
