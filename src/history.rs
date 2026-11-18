@@ -21,7 +21,8 @@ pub struct Entry {
     pub h: i32,
     /// Where it was on screen, so a pin opens right over the same spot.
     pub at: (i32, i32),
-    /// Small BGRA preview `(w, h, pixels)`.
+    /// Small BGRA preview `(w, h, pixels)` (Windows menus take images that way).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub thumb: (i32, i32, Vec<u8>),
     /// The same preview as PNG (Linux tray menus take images that way).
     #[cfg_attr(windows, allow(dead_code))]
@@ -76,6 +77,7 @@ impl History {
         self.entries.iter()
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))] // the Linux tray lists entries instead
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

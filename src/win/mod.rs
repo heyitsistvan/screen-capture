@@ -124,7 +124,7 @@ fn mode_to_wparam(mode: Mode) -> usize {
     match mode {
         Mode::Capture => 0,
         Mode::Gif => 1,
-        Mode::Pin => 2,
+        Mode::Pin | Mode::EditPin => 2,
     }
 }
 
@@ -467,7 +467,7 @@ fn edit_pin(target: HWND) {
     let Some(edit) = pin::content(target) else { return };
     show_pins(false);
     let (main, fonts) = with_app(|a| (a.hwnd, a.fonts.clone()));
-    let h = overlay::open(main, Mode::Pin, fonts, Some(edit));
+    let h = overlay::open(main, Mode::EditPin, fonts, Some(edit));
     with_app(|a| a.overlay = h);
     if h.is_null() {
         show_pins(true);

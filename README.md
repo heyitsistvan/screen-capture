@@ -41,7 +41,7 @@ At runtime it needs `libpipewire-0.3` (present on any current desktop). Optional
 | Key / action | What it does |
 |---|---|
 | **PrtSc** | Open the capture overlay |
-| **Ctrl+PrtSc** | The same, but finishing pins the capture on screen (see [Pinned captures](#pinned-captures)) |
+| **Ctrl+PrtSc** | Pin an area: select it (or click a window) and it floats on screen right away (see [Pinned captures](#pinned-captures)) |
 | **Shift+PrtSc** | Record a GIF: select an area (or click a window) and recording starts immediately |
 | **PrtSc** while recording | Stop and save the GIF |
 | Tray icon click | Capture; right-click for the menu |
@@ -82,15 +82,16 @@ On Windows, Alt/Win+PrtSc are left alone, so the Windows built-ins keep working.
   Text the OCR misses gets ordinary pixelation; if OCR isn't available at all, the area becomes
   a mosaic of its colors instead. The result is frozen when you draw it, so in GIFs nothing
   typed behind it shows.
-- **Ctrl+C**, **Enter** or **double-click** copies the image to the clipboard and closes (in
-  Ctrl+PrtSc mode they also pin it). **Ctrl+P** or the pin button copies it and pins it on
-  screen. **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** records the selection as a GIF.
+- **Ctrl+C**, **Enter** or **double-click** copies the image to the clipboard and closes.
+  **Ctrl+P** or the pin button copies it and pins it on screen. **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** records the selection as a GIF.
   **Esc** closes. **Right-click** steps back (cancels tool, then selection, then closes).
 
 ### Pinned captures
 
-A pinned capture floats above other windows, exactly where it was taken, so you can compare it
-with the screen as it changes (or with another pin):
+**Ctrl+PrtSc** skips the editor: select an area (or click a window) and it's pinned and copied at
+once; draw on it later with the pin's edit button if you need to. The editor's pin button pins
+an annotated capture. A pinned capture floats above other windows, exactly where it was taken, so
+you can compare it with the screen as it changes (or with another pin):
 
 - Hovering it shows a small **toolbar**: the zoom (when it isn't 100%; click to go back),
   **opacity** (cycles 100, 80, 60, 40%), **copy**, **save**, **edit** and **×** to close.

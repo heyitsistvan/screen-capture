@@ -125,6 +125,7 @@ impl Pin {
         self.set_layers(layers);
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))] // the Windows menu shows it
     pub fn zoom(&self) -> f32 {
         self.zoom
     }
@@ -213,6 +214,7 @@ impl Pin {
 
     /// The height that keeps the picture's proportions at window width `ww`
     /// (or the width at window height `wh`), for resizing by an edge.
+    #[cfg_attr(not(windows), allow(dead_code))] // Linux leaves resizing to the window manager
     pub fn keep_aspect(&self, ww: i32, wh: i32, by_width: bool) -> (i32, i32) {
         let (iw, ih) = ((ww - 2 * BORDER).max(1) as f32, (wh - 2 * BORDER).max(1) as f32);
         if by_width {

@@ -634,7 +634,7 @@ impl App {
         let Some(p) = self.pins.iter().find(|p| p.window.id() == id) else { return };
         let (w, h, base, shapes, at) = p.content();
         self.edit = Some(EditPin { target: id, w, h, base, shapes, at });
-        self.begin_capture(el, Mode::Pin, None);
+        self.begin_capture(el, Mode::EditPin, None);
     }
 
     fn show_pins(&mut self, show: bool) {

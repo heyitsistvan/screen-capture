@@ -331,8 +331,11 @@ struct TextEdit {
 pub enum Mode {
     /// Select an area to copy, save or pin (PrtSc).
     Capture,
-    /// The same, but finishing pins the area to the screen (Ctrl+PrtSc).
+    /// Select an area and it's pinned to the screen right away (Ctrl+PrtSc);
+    /// the pin can be edited later.
     Pin,
+    /// Editing a pinned capture: finishing updates the pin.
+    EditPin,
     /// Select an area to record (Shift+PrtSc).
     Gif,
 }
@@ -373,8 +376,10 @@ enum Part {
 pub struct Editor {
     host: Box<dyn Host>,
     gif_mode: bool,
+    /// Selecting the area pins it right away.
+    instant_pin: bool,
     /// Finishing (Enter, double-click, Ctrl+C) pins instead of just copying.
-    pin_mode: bool,
+    finish_pins: bool,
     /// Screen position of the window's (0, 0).
     ox: i32,
     oy: i32,
@@ -453,7 +458,8 @@ impl Editor {
         let mut ed = Box::new(Editor {
             host,
             gif_mode: mode == Mode::Gif,
-            pin_mode: mode == Mode::Pin,
+            instant_pin: mode == Mode::Pin,
+            finish_pins: mode == Mode::EditPin,
             ox: origin.0,
             oy: origin.1,
             w,
@@ -625,7 +631,7 @@ impl Editor {
 
     fn layout(&self) -> Option<Layout> {
         let sel = self.sel?;
-        if self.gif_mode || matches!(self.drag, Drag::NewSel { .. }) {
+        if self.select_only() || matches!(self.drag, Drag::NewSel { .. }) {
             return None;
         }
         let b = self.px(34.0);
@@ -787,7 +793,7 @@ impl Editor {
             return None;
         }
         // Without window positions (Wayland), a click selects the screen.
-        let text = match (self.gif_mode, self.pin_mode, self.windows.is_empty()) {
+        let text = match (self.gif_mode, self.instant_pin, self.windows.is_empty()) {
             (true, _, false) => "Record GIF: drag to select an area, or click a window   ·   Esc to cancel",
             (true, _, true) => "Record GIF: drag to select an area, or click for the whole screen   ·   Esc to cancel",
             (false, true, false) => "Pin to the screen: drag to select an area, or click a window   ·   Esc to cancel",
@@ -996,7 +1002,7 @@ impl Editor {
 
     fn draw_ui(&self, cv: &mut Canvas) {
         if let Some(sel) = self.sel {
-            self.draw_frame(cv, sel, !self.gif_mode);
+            self.draw_frame(cv, sel, !self.select_only());
             let (lr, lt) = self.size_label(sel);
             self.draw_label(cv, lr, &lt, self.pxf(12.0));
             if let Some(lay) = self.layout() {
@@ -1608,7 +1614,7 @@ impl Editor {
                         } else {
                             Cursor::Cross
                         }
-                    } else if sel.contains(x, y) && !self.gif_mode {
+                    } else if sel.contains(x, y) && !self.select_only() {
                         Cursor::Move
                     } else {
                         Cursor::Cross
@@ -1745,7 +1751,7 @@ impl Editor {
                     self.start_shape(tool, x, y);
                     self.drag = Drag::Draw;
                 }
-            } else if sel.contains(x, y) && !self.gif_mode {
+            } else if sel.contains(x, y) && !self.select_only() {
                 self.drag = Drag::Move { orig: sel, sx: x, sy: y };
             } else {
                 self.drag = Drag::Pending;
@@ -1769,9 +1775,7 @@ impl Editor {
                 if let Some(r) = self.window_at(x, y) {
                     self.set_sel(Some(r));
                     self.hover_win = None;
-                    if self.gif_mode {
-                        action = Some(Action::Gif);
-                    }
+                    action = self.on_selected();
                 }
             }
             Drag::NewSel { .. } => {
@@ -1779,8 +1783,8 @@ impl Editor {
                     if s.w() < 3 || s.h() < 3 {
                         self.set_sel(None);
                         self.hover_win = self.window_at(x, y);
-                    } else if self.gif_mode {
-                        action = Some(Action::Gif);
+                    } else {
+                        action = self.on_selected();
                     }
                 }
             }
@@ -1858,9 +1862,26 @@ impl Editor {
         }
     }
 
-    /// Enter, double-click or Ctrl+C: copy, and in pin mode also pin.
+    /// GIF and Ctrl+PrtSc modes: selecting the area is all there is to do.
+    fn select_only(&self) -> bool {
+        self.gif_mode || self.instant_pin
+    }
+
+    /// What selecting an area does by itself (record or pin), if anything.
+    fn on_selected(&self) -> Option<Action> {
+        if self.gif_mode {
+            Some(Action::Gif)
+        } else if self.instant_pin {
+            Some(Action::Pin)
+        } else {
+            None
+        }
+    }
+
+    /// Enter, double-click or Ctrl+C: copy, and when editing a pin also
+    /// update it.
     fn finish(&self) -> Action {
-        if self.pin_mode {
+        if self.finish_pins || self.instant_pin {
             Action::Pin
         } else {
             Action::Copy
@@ -2008,18 +2029,19 @@ impl Editor {
                 match key {
                     b'C' if self.sel.is_some() => action = Some(self.finish()),
                     b'S' if self.sel.is_some() => action = Some(Action::Save),
-                    b'P' if self.sel.is_some() && !self.gif_mode => action = Some(Action::Pin),
+                    b'P' if self.sel.is_some() && !self.select_only() => action = Some(Action::Pin),
                     b'Z' if shift => self.redo(),
                     b'Z' => self.undo(),
                     b'Y' => self.redo(),
                     b'A' => {
                         let m = self.monitor_at(self.mouse.0, self.mouse.1);
                         self.set_sel(Some(m));
+                        action = self.on_selected();
                     }
                     _ => {}
                 }
             }
-            _ if self.sel.is_some() && !self.gif_mode => {
+            _ if self.sel.is_some() && !self.select_only() => {
                 let key = vk as u8;
                 if key == b'G' {
                     action = Some(Action::Gif);
@@ -2222,10 +2244,27 @@ pub fn pin_mode_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     ov.oy = 40;
     check(ov.selection_on_screen() == Some(Rect::new(-1820, 140, -1520, 340)), "selection not in screen coordinates")?;
 
+    // Ctrl+PrtSc: dragging an area, or clicking a window, pins it at once;
+    // there are no toolbars.
     let mut ov = editor(Mode::Pin);
-    check(matches!(ov.on_key(key::ENTER, Mods::default()), Some(Action::Pin)), "Enter didn't pin in pin mode")?;
-    check(matches!(ov.on_key(b'C' as u16, ctrl), Some(Action::Pin)), "Ctrl+C didn't pin in pin mode")?;
-    check(matches!(ov.on_down(250, 200, true), Some(Action::Pin)), "double-click didn't pin in pin mode")?;
+    ov.sel = None;
+    ov.on_down(100, 100, false);
+    ov.on_move(200, 150, false);
+    ov.on_move(300, 220, false);
+    check(matches!(ov.on_up(300, 220), Some(Action::Pin)), "selecting an area didn't pin it at once")?;
+    check(ov.selection_on_screen() == Some(Rect::new(100, 100, 300, 220)), "pinned the wrong area")?;
+    check(ov.layout().is_none(), "Ctrl+PrtSc mode shows toolbars")?;
+    let mut ov = editor(Mode::Pin);
+    ov.sel = None;
+    ov.on_down(400, 250, false);
+    check(matches!(ov.on_up(400, 250), Some(Action::Pin)), "clicking didn't pin the window under the cursor")?;
+
+    // Editing a pin: Enter, Ctrl+C and double-click update it.
+    let mut ov = editor(Mode::EditPin);
+    check(matches!(ov.on_key(key::ENTER, Mods::default()), Some(Action::Pin)), "Enter didn't update the pin")?;
+    check(matches!(ov.on_key(b'C' as u16, ctrl), Some(Action::Pin)), "Ctrl+C didn't update the pin")?;
+    check(matches!(ov.on_down(250, 200, true), Some(Action::Pin)), "double-click didn't update the pin")?;
+    check(ov.layout().is_some(), "editing a pin has no toolbars")?;
 
     let mut ov = editor(Mode::Gif);
     check(ov.on_key(b'P' as u16, ctrl).is_none(), "Ctrl+P pinned in GIF mode")?;
@@ -2237,14 +2276,14 @@ pub fn pin_mode_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     let picture: Vec<u8> = (0..pw * ph).flat_map(|i| [(i % 256) as u8, 40, 90, 255]).collect();
     let at = screen.place((750, 420), pw, ph, &picture);
     check(at == Rect::new(600, 350, 800, 500), "a picture sticking out wasn't moved inside")?;
-    let mut ov = Editor::new(Box::new(NullHost), screen, fonts.clone(), Mode::Pin, 1.0);
+    let mut ov = Editor::new(Box::new(NullHost), screen, fonts.clone(), Mode::EditPin, 1.0);
     let shapes = vec![Shape::Rect { a: (10.5, 10.5), b: (50.5, 40.5), color: PALETTE[0], width: 3.0, outline: None }];
     ov.preset(at, shapes.clone());
     let (lw, lh, base, back) = ov.layers().ok_or("no selection after preset")?;
     check((lw, lh) == (pw, ph) && base == picture, "the picture didn't come back unchanged")?;
     check(format!("{back:?}") == format!("{shapes:?}"), "the drawings didn't come back unchanged")?;
     check(matches!(ov.on_key(key::ENTER, Mods::default()), Some(Action::Pin)), "Enter didn't finish the edit")?;
-    Ok("Enter copies, Ctrl+P and the Pin button pin; pin mode pins; editing a pin restores picture and drawings".into())
+    Ok("Enter copies, Ctrl+P pins; Ctrl+PrtSc pins on selection; editing restores picture and drawings".into())
 }
 
 /// Renders the overlay into a PNG without showing a window (debug self-test).
