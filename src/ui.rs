@@ -4,6 +4,7 @@ use fontdue::Font;
 use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, PixmapMut, Rect as SkRect, Stroke, StrokeDash, Transform};
 
 use crate::annotate::Rgba;
+use crate::recording::Format;
 use crate::text::{self, Fonts};
 use crate::util::Rect;
 
@@ -173,13 +174,20 @@ impl<'a> Canvas<'a> {
                 pb.line_to(m(10.0), 19.0);
                 self.stroke_path(pb.finish(), c, sw, tf);
             }
-            Icon::Gif => {
-                let px = size * 0.5;
-                let tw = text::line_width(&fonts.bold, "GIF", px);
+            Icon::Record(format) => {
+                // The format's name, made smaller if it wouldn't fit.
+                let label = format.label();
+                let mut px = size * 0.5;
+                let fit = size * 0.9;
+                let mut tw = text::line_width(&fonts.bold, label, px);
+                if tw > fit {
+                    px *= fit / tw;
+                    tw = fit;
+                }
                 let (ascent, _) = text::line_metrics(&fonts.bold, px);
                 // Center on cap height (~0.7em) rather than the full line box.
                 let top = cy + px * 0.35 - ascent;
-                self.text(cx - tw / 2.0, top, "GIF", px, c, &fonts.bold);
+                self.text(cx - tw / 2.0, top, label, px, c, &fonts.bold);
             }
             Icon::Pin => {
                 // A pushpin: head, collar, needle.
@@ -227,7 +235,8 @@ pub enum Icon {
     Pixelate,
     Undo,
     Redo,
-    Gif,
+    /// The record button: the format's name.
+    Record(Format),
     Pin,
     Copy,
     Save,

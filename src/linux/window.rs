@@ -215,6 +215,7 @@ impl EditorWindow {
             Key::Named(NamedKey::ArrowDown) => Some(key::DOWN),
             Key::Named(NamedKey::Delete) => Some(key::DELETE),
             Key::Named(NamedKey::Backspace) => Some(key::BACKSPACE),
+            Key::Named(NamedKey::Tab) => Some(key::TAB),
             Key::Character(s) => s.chars().next().filter(char::is_ascii_alphabetic).map(|c| c.to_ascii_uppercase() as u16),
             _ => None,
         };

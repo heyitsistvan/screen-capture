@@ -1,5 +1,5 @@
 //! Wayland desktop portals (xdg-desktop-portal): screenshots, the global
-//! PrtSc shortcut and screen casting for GIF recording. They're async, so they
+//! PrtSc shortcut and screen casting for recording. They're async, so they
 //! run on a small tokio runtime and report back through the event loop.
 
 use std::os::fd::OwnedFd;
@@ -49,7 +49,9 @@ pub async fn global_shortcuts(on_press: impl Fn(Mode, Option<String>) + Send + '
     let shortcuts = [
         NewShortcut::new("capture", "Capture an area").preferred_trigger("Print"),
         NewShortcut::new("pin", "Capture an area and pin it on screen").preferred_trigger("<Control>Print"),
-        NewShortcut::new("gif", "Record an area as a GIF").preferred_trigger("<Shift>Print"),
+        // The id is still "gif" (from before MP4), so desktops keep the key
+        // users bound to it.
+        NewShortcut::new("gif", "Record an area (GIF or MP4)").preferred_trigger("<Shift>Print"),
     ];
     portal.bind_shortcuts(&session, &shortcuts, None).await.map_err(err)?.response().map_err(err)?;
     let mut presses = portal.receive_activated().await.map_err(err)?;
@@ -57,7 +59,7 @@ pub async fn global_shortcuts(on_press: impl Fn(Mode, Option<String>) + Send + '
         // Lets the compositor give our window focus (xdg-activation).
         let token = press.options().get("activation_token").and_then(|v| v.downcast_ref::<String>().ok());
         let mode = match press.shortcut_id() {
-            "gif" => Mode::Gif,
+            "gif" => Mode::Record,
             "pin" => Mode::Pin,
             _ => Mode::Capture,
         };

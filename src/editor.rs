@@ -1,6 +1,6 @@
 //! The capture editor: a frozen screenshot on which the user picks an area
-//! (drag, or click a window), annotates it, then copies/saves it or starts a
-//! GIF recording of it.
+//! (drag, or click a window), annotates it, then copies/saves it or records
+//! it (as a GIF or an MP4).
 //!
 //! It's platform-independent: a window shell (Windows or Linux) feeds it input,
 //! presents its back buffer and carries out the [`Action`]s it returns; the
@@ -15,6 +15,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::annotate::{self, Pt, Rgba, Shape, Tool};
+use crate::recording::Format;
 use crate::text::{self, Fonts};
 use crate::ui::{Canvas, Icon};
 use crate::util::Rect;
@@ -56,6 +57,7 @@ pub struct Mods {
 /// passed as their uppercase ASCII code.
 pub mod key {
     pub const BACKSPACE: u16 = 0x08;
+    pub const TAB: u16 = 0x09;
     pub const ENTER: u16 = 0x0D;
     pub const ESCAPE: u16 = 0x1B;
     pub const LEFT: u16 = 0x25;
@@ -76,7 +78,8 @@ pub struct Screen {
     /// Top-level windows, topmost first, for click-to-select (may be empty).
     pub windows: Vec<Rect>,
     pub mouse: (i32, i32),
-    /// Screen position of (0, 0); GIF regions are reported in screen space.
+    /// Screen position of (0, 0); recorded regions are reported in screen
+    /// space.
     pub origin: (i32, i32),
 }
 
@@ -98,12 +101,13 @@ impl Screen {
     }
 }
 
-/// What the editor hands over when the user starts a GIF recording.
-pub struct GifRequest {
+/// What the editor hands over when the user starts a recording.
+pub struct RecordRequest {
     /// Area to record, in screen coordinates.
     pub region: Rect,
     /// Annotations to burn into every frame, relative to the region.
     pub shapes: Vec<Shape>,
+    pub format: Format,
 }
 
 const ACCENT: Rgba = Rgba(10, 132, 255, 255);
@@ -160,6 +164,8 @@ struct Prefs {
     /// The mode the O key switches back to after turning the outline off.
     outline_on: OutlineMode,
     outline_custom: Rgba,
+    /// What recordings are saved as (Tab switches it).
+    format: Format,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -211,6 +217,15 @@ pub fn apply_outline_setting(s: &str) {
     PREFS.with(|c| c.set(p));
 }
 
+/// The recording format, as last chosen (in the editor or the tray menu).
+pub fn record_format() -> Format {
+    PREFS.with(|p| p.get().format)
+}
+
+pub fn set_record_format(format: Format) {
+    PREFS.with(|c| c.set(Prefs { format, ..c.get() }));
+}
+
 thread_local! {
     static PREFS: Cell<Prefs> = const {
         Cell::new(Prefs {
@@ -223,6 +238,7 @@ thread_local! {
             outline: OutlineMode::Auto,
             outline_on: OutlineMode::Auto,
             outline_custom: Rgba(255, 214, 10, 255),
+            format: Format::Gif,
         })
     };
 }
@@ -233,7 +249,7 @@ enum Btn {
     Color,
     Undo,
     Redo,
-    Gif,
+    Record(Format),
     Pin,
     Copy,
     Save,
@@ -250,7 +266,8 @@ impl Btn {
             Btn::Color => "Color",
             Btn::Undo => "Undo (Ctrl+Z)",
             Btn::Redo => "Redo (Ctrl+Y)",
-            Btn::Gif => "Record GIF of this area (G)",
+            Btn::Record(Format::Gif) => "Record a GIF of this area (G)   ·   Tab switches to MP4",
+            Btn::Record(Format::Mp4) => "Record an MP4 of this area (G)   ·   Tab switches to GIF",
             Btn::Pin => "Pin to the screen, to compare (Ctrl+P)",
             Btn::Copy => "Copy to clipboard (Ctrl+C)",
             Btn::Save => "Save as PNG (Ctrl+S)",
@@ -270,7 +287,7 @@ impl Btn {
             Btn::Tool(t) => TOOLS.iter().find(|x| x.0 == t)?.1,
             Btn::Undo => Icon::Undo,
             Btn::Redo => Icon::Redo,
-            Btn::Gif => Icon::Gif,
+            Btn::Record(f) => Icon::Record(f),
             Btn::Pin => Icon::Pin,
             Btn::Copy => Icon::Copy,
             Btn::Save => Icon::Save,
@@ -336,8 +353,8 @@ pub enum Mode {
     Pin,
     /// Editing a pinned capture: finishing updates the pin.
     EditPin,
-    /// Select an area to record (Shift+PrtSc).
-    Gif,
+    /// Select an area to record, as a GIF or an MP4 (Shift+PrtSc).
+    Record,
 }
 
 /// Things the window shell does after an input handler returns, because they
@@ -348,7 +365,8 @@ pub enum Action {
     Save,
     /// Copy the image and keep it on screen in a floating window.
     Pin,
-    Gif,
+    /// Record the area (in the format of [`Editor::record_request`]).
+    Record,
     ChooseColor,
     ChooseOutlineColor,
     CopyColor,
@@ -375,7 +393,8 @@ enum Part {
 
 pub struct Editor {
     host: Box<dyn Host>,
-    gif_mode: bool,
+    /// Selecting the area starts recording it.
+    record_mode: bool,
     /// Selecting the area pins it right away.
     instant_pin: bool,
     /// Finishing (Enter, double-click, Ctrl+C) pins instead of just copying.
@@ -457,7 +476,7 @@ impl Editor {
         }
         let mut ed = Box::new(Editor {
             host,
-            gif_mode: mode == Mode::Gif,
+            record_mode: mode == Mode::Record,
             instant_pin: mode == Mode::Pin,
             finish_pins: mode == Mode::EditPin,
             ox: origin.0,
@@ -655,7 +674,8 @@ impl Editor {
         let vy = (sel.b - vh).min(mon.b - vh).max(mon.t);
         let vbar = Rect::xywh(vx, vy, vw, vh);
 
-        let hitems = [Some(Btn::Gif), None, Some(Btn::Pin), Some(Btn::Copy), Some(Btn::Save), None, Some(Btn::Close)];
+        let rec = Btn::Record(self.prefs.format);
+        let hitems = [Some(rec), None, Some(Btn::Pin), Some(Btn::Copy), Some(Btn::Save), None, Some(Btn::Close)];
         let hb = hitems.iter().filter(|i| i.is_some()).count() as i32;
         let (hw, hh) = (2 * p + hb * b + (hitems.len() as i32 - hb) * sep, b + 2 * p);
         let hy = if sel.b + gap + hh <= mon.b {
@@ -793,9 +813,19 @@ impl Editor {
             return None;
         }
         // Without window positions (Wayland), a click selects the screen.
-        let text = match (self.gif_mode, self.instant_pin, self.windows.is_empty()) {
-            (true, _, false) => "Record GIF: drag to select an area, or click a window   ·   Esc to cancel",
-            (true, _, true) => "Record GIF: drag to select an area, or click for the whole screen   ·   Esc to cancel",
+        let text = match (self.record_mode, self.instant_pin, self.windows.is_empty()) {
+            (true, _, false) => match self.prefs.format {
+                Format::Gif => "Record a GIF: drag to select an area, or click a window   ·   Tab switches to MP4   ·   Esc to cancel",
+                Format::Mp4 => "Record an MP4: drag to select an area, or click a window   ·   Tab switches to GIF   ·   Esc to cancel",
+            },
+            (true, _, true) => match self.prefs.format {
+                Format::Gif => {
+                    "Record a GIF: drag to select an area, or click for the whole screen   ·   Tab switches to MP4   ·   Esc to cancel"
+                }
+                Format::Mp4 => {
+                    "Record an MP4: drag to select an area, or click for the whole screen   ·   Tab switches to GIF   ·   Esc to cancel"
+                }
+            },
             (false, true, false) => "Pin to the screen: drag to select an area, or click a window   ·   Esc to cancel",
             (false, true, true) => {
                 "Pin to the screen: drag to select an area, or click for the whole screen   ·   Esc to cancel"
@@ -1572,14 +1602,25 @@ impl Editor {
         self.sel.map(|s| s.offset(self.ox, self.oy))
     }
 
-    pub fn gif_request(&mut self) -> Option<GifRequest> {
+    /// The area to record (in screen coordinates), its drawings and the
+    /// format chosen.
+    pub fn record_request(&mut self) -> Option<RecordRequest> {
         self.commit_edit();
         let sel = self.sel?;
         let mut shapes = self.shapes.clone();
         for s in &mut shapes {
             s.translate(-(sel.l as f32), -(sel.t as f32));
         }
-        Some(GifRequest { region: sel.offset(self.ox, self.oy), shapes })
+        Some(RecordRequest { region: sel.offset(self.ox, self.oy), shapes, format: self.prefs.format })
+    }
+
+    /// Switches recordings between GIF and MP4 (Tab).
+    fn toggle_format(&mut self) {
+        self.prefs.format = self.prefs.format.other();
+        // The hint keeps its place, so it isn't repainted by itself.
+        if let Some((r, _)) = self.hint() {
+            self.host.invalidate(r);
+        }
     }
 
     // ----- input ------------------------------------------------------------
@@ -1854,7 +1895,7 @@ impl Editor {
                 self.redo();
                 None
             }
-            Btn::Gif => Some(Action::Gif),
+            Btn::Record(_) => Some(Action::Record),
             Btn::Pin => Some(Action::Pin),
             Btn::Copy => Some(Action::Copy),
             Btn::Save => Some(Action::Save),
@@ -1862,15 +1903,16 @@ impl Editor {
         }
     }
 
-    /// GIF and Ctrl+PrtSc modes: selecting the area is all there is to do.
+    /// Recording and Ctrl+PrtSc modes: selecting the area is all there is to
+    /// do.
     fn select_only(&self) -> bool {
-        self.gif_mode || self.instant_pin
+        self.record_mode || self.instant_pin
     }
 
     /// What selecting an area does by itself (record or pin), if anything.
     fn on_selected(&self) -> Option<Action> {
-        if self.gif_mode {
-            Some(Action::Gif)
+        if self.record_mode {
+            Some(Action::Record)
         } else if self.instant_pin {
             Some(Action::Pin)
         } else {
@@ -1995,6 +2037,9 @@ impl Editor {
                 }
             }
             key::ENTER if self.sel.is_some() => action = Some(self.finish()),
+            // Where recording is on offer: choosing the area to record, or
+            // the toolbar's record button.
+            key::TAB if self.record_mode || (self.sel.is_some() && !self.select_only()) => self.toggle_format(),
             key::LEFT | key::RIGHT | key::UP | key::DOWN => {
                 if let (Some(s), Drag::None) = (self.sel, self.drag) {
                     let step = if shift { 10 } else { 1 };
@@ -2044,7 +2089,7 @@ impl Editor {
             _ if self.sel.is_some() && !self.select_only() => {
                 let key = vk as u8;
                 if key == b'G' {
-                    action = Some(Action::Gif);
+                    action = Some(Action::Record);
                 } else if key == b'O' {
                     let m = if self.prefs.outline == OutlineMode::Off { self.prefs.outline_on } else { OutlineMode::Off };
                     self.set_outline(m);
@@ -2266,8 +2311,24 @@ pub fn pin_mode_selftest(fonts: Arc<Fonts>) -> Result<String, String> {
     check(matches!(ov.on_down(250, 200, true), Some(Action::Pin)), "double-click didn't update the pin")?;
     check(ov.layout().is_some(), "editing a pin has no toolbars")?;
 
-    let mut ov = editor(Mode::Gif);
-    check(ov.on_key(b'P' as u16, ctrl).is_none(), "Ctrl+P pinned in GIF mode")?;
+    let mut ov = editor(Mode::Record);
+    check(ov.on_key(b'P' as u16, ctrl).is_none(), "Ctrl+P pinned in recording mode")?;
+
+    // Tab switches the recording format, both when choosing the area to
+    // record and in the editor, and the request carries it.
+    let start = ov.prefs.format;
+    ov.sel = None;
+    ov.on_key(key::TAB, Mods::default());
+    check(ov.prefs.format == start.other(), "Tab didn't switch the format while choosing the area")?;
+    let mut ov = editor(Mode::Capture);
+    let start = ov.prefs.format;
+    ov.on_key(key::TAB, Mods::default());
+    check(ov.record_request().map(|r| r.format) == Some(start.other()), "Tab didn't switch the recorded format")?;
+    check(matches!(ov.on_key(b'G' as u16, Mods::default()), Some(Action::Record)), "G didn't record")?;
+    let mut ov = editor(Mode::Pin);
+    let start = ov.prefs.format;
+    ov.on_key(key::TAB, Mods::default());
+    check(ov.prefs.format == start, "Tab switched the format in Ctrl+PrtSc mode")?;
 
     // Editing a pin again: its picture goes back on the screenshot, the
     // selection and drawings are restored, and the layers come back the same.

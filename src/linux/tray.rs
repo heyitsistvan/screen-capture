@@ -7,6 +7,7 @@ use winit::event_loop::EventLoopProxy;
 
 use super::{Cmd, UserEvent};
 use crate::icon;
+use crate::recording::Format;
 use crate::settings::FPS_CHOICES;
 use crate::util::{APP_NAME, HOMEPAGE, MAKER, REPOSITORY, VERSION};
 
@@ -15,6 +16,7 @@ pub struct TrayModel {
     pub recording: bool,
     pub fps: u32,
     pub cursor: bool,
+    pub format: Format,
     pub autostart: bool,
     /// Recent captures, newest first: (history id, label, thumbnail PNG).
     pub history: Vec<(u64, String, Vec<u8>)>,
@@ -48,11 +50,11 @@ impl Tray for TrayModel {
 
     fn tool_tip(&self) -> ToolTip {
         let description = if self.recording {
-            "Recording a GIF: press PrtSc to stop"
+            "Recording: press PrtSc to stop".to_string()
         } else {
-            "PrtSc: capture an area · Shift+PrtSc: record a GIF"
+            format!("PrtSc: capture an area · Shift+PrtSc: record {}", self.format.label())
         };
-        ToolTip { title: APP_NAME.into(), description: description.into(), ..Default::default() }
+        ToolTip { title: APP_NAME.into(), description, ..Default::default() }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -74,6 +76,7 @@ impl Tray for TrayModel {
             .into()
         };
         let fps = FPS_CHOICES.iter().map(|&f| check(&format!("{f} fps"), f == self.fps, Cmd::SetFps(f))).collect();
+        let formats = Format::ALL.iter().map(|&f| check(f.label(), f == self.format, Cmd::SetFormat(f))).collect();
         let recent: MenuItem<Self> = if self.history.is_empty() {
             StandardItem { label: "Recent captures".into(), enabled: false, ..Default::default() }.into()
         } else {
@@ -103,9 +106,9 @@ impl Tray for TrayModel {
             item("Capture area (PrtSc)", Cmd::Capture),
             item("Capture and pin (Ctrl+PrtSc)", Cmd::Pin),
             if self.recording {
-                item("Stop GIF recording (PrtSc)", Cmd::Stop)
+                item("Stop recording (PrtSc)", Cmd::Stop)
             } else {
-                item("Record GIF (Shift+PrtSc)", Cmd::Gif)
+                item(&format!("Record {} (Shift+PrtSc)", self.format.label()), Cmd::Record)
             },
             MenuItem::Separator,
             recent,
@@ -117,9 +120,10 @@ impl Tray for TrayModel {
             }
             .into(),
             MenuItem::Separator,
-            SubMenu { label: "GIF frame rate".into(), submenu: fps, ..Default::default() }.into(),
-            check("Show mouse cursor in GIFs", self.cursor, Cmd::ToggleCursor),
-            item("Open GIF folder", Cmd::OpenFolder),
+            SubMenu { label: "Recording format".into(), submenu: formats, ..Default::default() }.into(),
+            SubMenu { label: "Recording frame rate".into(), submenu: fps, ..Default::default() }.into(),
+            check("Show mouse cursor in recordings", self.cursor, Cmd::ToggleCursor),
+            item("Open recordings folder", Cmd::OpenFolder),
             MenuItem::Separator,
             check("Start at login", self.autostart, Cmd::ToggleAutostart),
             MenuItem::Separator,

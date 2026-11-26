@@ -54,7 +54,7 @@ pub fn set_image(hwnd: HWND, w: i32, h: i32, bgra: &[u8]) -> bool {
 }
 
 /// Puts a file on the clipboard so it can be pasted into Explorer, chat apps,
-/// e-mail and so on (the way an animated GIF survives a copy/paste).
+/// e-mail and so on (the way a recording, GIF or MP4, survives a copy/paste).
 pub fn set_file(hwnd: HWND, path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     let df = DROPFILES {

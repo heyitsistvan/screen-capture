@@ -1,6 +1,6 @@
 //! The editor's full-screen window on Windows: captures the screen, feeds
 //! Win32 input to the [`Editor`], presents its frames and carries out its
-//! actions (clipboard, save dialog, color picker, starting a GIF).
+//! actions (clipboard, save dialog, color picker, starting a recording).
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -40,7 +40,7 @@ use super::clipboard;
 use crate::editor::{Action, Cursor, Editor, Host, Mode, Mods, Screen};
 use crate::text::Fonts;
 use crate::util::{self, wide, Rect};
-use super::{Captured, EditPin, WM_APP_CAPTURED, WM_APP_OVERLAY_DONE, WM_APP_START_GIF};
+use super::{Captured, EditPin, WM_APP_CAPTURED, WM_APP_OVERLAY_DONE, WM_APP_START_REC};
 
 const CLASS: &str = "ScreenCaptureOverlay";
 
@@ -347,9 +347,9 @@ unsafe fn perform(hwnd: HWND, p: *mut Shell, action: Action) {
             captured(p, w, h, px, true);
             DestroyWindow(hwnd);
         }
-        Action::Gif => {
-            if let Some(req) = (*p).editor.gif_request() {
-                PostMessageW((*p).main, WM_APP_START_GIF, 0, Box::into_raw(Box::new(req)) as LPARAM);
+        Action::Record => {
+            if let Some(req) = (*p).editor.record_request() {
+                PostMessageW((*p).main, WM_APP_START_REC, 0, Box::into_raw(Box::new(req)) as LPARAM);
             }
             DestroyWindow(hwnd);
         }

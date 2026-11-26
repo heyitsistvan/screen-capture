@@ -4,13 +4,17 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::recording::Format;
 use crate::util;
 
 pub const FPS_CHOICES: [u32; 5] = [10, 15, 20, 25, 30];
 
 pub struct Settings {
+    /// Recordings: frame rate, mouse cursor, and GIF or MP4. (The first two
+    /// are stored as `gif_fps` and `gif_cursor`, from before MP4.)
     pub fps: u32,
     pub cursor: bool,
+    pub format: Format,
     /// Outline around drawings: "auto", "off", "white", "black" or "#rrggbb".
     pub outline: String,
     /// Wayland: restore token so the screen-cast portal doesn't ask which
@@ -25,6 +29,7 @@ impl Default for Settings {
         Settings {
             fps: 15,
             cursor: true,
+            format: Format::Gif,
             outline: "auto".into(),
             screencast_token: String::new(),
             shortcut_hint_shown: false,
@@ -59,6 +64,7 @@ impl Settings {
                     }
                 }
                 "gif_cursor" => s.cursor = yes(v),
+                "record_format" => s.format = Format::from_key(v).unwrap_or_default(),
                 "outline_color" => s.outline = v.to_string(),
                 "screencast_token" => s.screencast_token = v.to_string(),
                 "shortcut_hint_shown" => s.shortcut_hint_shown = yes(v),
@@ -73,7 +79,13 @@ impl Settings {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let mut text = format!("gif_fps={}\ngif_cursor={}\noutline_color={}\n", self.fps, self.cursor as u8, self.outline);
+        let mut text = format!(
+            "gif_fps={}\ngif_cursor={}\nrecord_format={}\noutline_color={}\n",
+            self.fps,
+            self.cursor as u8,
+            self.format.key(),
+            self.outline
+        );
         if !self.screencast_token.is_empty() {
             text += &format!("screencast_token={}\n", self.screencast_token);
         }
@@ -153,7 +165,7 @@ pub fn set_autostart(on: bool) -> bool {
     }
     let exe = std::env::current_exe().unwrap_or_default();
     let entry = format!(
-        "[Desktop Entry]\nType=Application\nName={}\nComment=Screenshots, annotations and GIF recording\n\
+        "[Desktop Entry]\nType=Application\nName={}\nComment=Screenshots, annotations and GIF/MP4 recording\n\
          Exec=\"{}\"\nIcon=camera-photo\nX-GNOME-Autostart-enabled=true\n",
         util::APP_NAME,
         exe.display()

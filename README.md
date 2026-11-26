@@ -2,7 +2,8 @@
 
 A Lightshot-style screenshot tool for Windows and Linux, written in Rust. Press **PrtSc**,
 select an area, draw on it, copy it. Press **Ctrl+PrtSc** to keep the capture floating on screen,
-to compare it with what changes. Press **Shift+PrtSc** to record the area as an animated GIF.
+to compare it with what changes. Press **Shift+PrtSc** to record the area as an animated GIF or an
+MP4 video.
 
 A single executable (about 1 MB on Windows) that lives in the notification area / system tray.
 
@@ -18,15 +19,18 @@ cargo build --release
 (installed with Visual Studio Build Tools), which is used to embed the icon and DPI manifest. No
 runtime dependencies.
 
-**Linux**: needs a C toolchain, clang (for the PipeWire bindings) and the PipeWire headers:
+**Linux**: needs a C and C++ toolchain (the C++ compiler builds the bundled OpenH264 encoder for
+MP4), clang (for the PipeWire bindings) and the PipeWire headers. `nasm`, if installed, makes
+OpenH264 faster; without it, it's built without assembly.
 
 | Distribution | Packages |
 |---|---|
 | Debian / Ubuntu | `build-essential pkg-config clang libpipewire-0.3-dev` |
-| Fedora | `gcc pkgconf clang-devel pipewire-devel` |
+| Fedora | `gcc gcc-c++ pkgconf clang-devel pipewire-devel` |
 | Arch | `base-devel clang pipewire` |
 
-At runtime it needs `libpipewire-0.3` (present on any current desktop). Optional extras:
+At runtime it needs `libpipewire-0.3` and `libstdc++` (both present on any current desktop).
+Optional extras:
 
 - `tesseract` (packages `tesseract-ocr` / `tesseract`): makes pixelate safe for text (see
   below). Without it, pixelate falls back to a color mosaic.
@@ -42,8 +46,8 @@ At runtime it needs `libpipewire-0.3` (present on any current desktop). Optional
 |---|---|
 | **PrtSc** | Open the capture overlay |
 | **Ctrl+PrtSc** | Pin an area: select it (or click a window) and it floats on screen right away (see [Pinned captures](#pinned-captures)) |
-| **Shift+PrtSc** | Record a GIF: select an area (or click a window) and recording starts immediately |
-| **PrtSc** while recording | Stop and save the GIF |
+| **Shift+PrtSc** | Record a GIF or an MP4 (see [Recordings](#recordings-gif-or-mp4)): select an area (or click a window) and recording starts immediately; **Tab** switches the format first |
+| **PrtSc** while recording | Stop and save the recording |
 | Tray icon click | Capture; right-click for the menu |
 
 On Windows, Alt/Win+PrtSc are left alone, so the Windows built-ins keep working.
@@ -80,10 +84,10 @@ On Windows, Alt/Win+PrtSc are left alone, so the Windows built-ins keep working.
   width. Images are pixelated normally, and text looks like pixelated text, just not the real
   text. What still shows is where words are and roughly how long, as with any redaction box.
   Text the OCR misses gets ordinary pixelation; if OCR isn't available at all, the area becomes
-  a mosaic of its colors instead. The result is frozen when you draw it, so in GIFs nothing
+  a mosaic of its colors instead. The result is frozen when you draw it, so in recordings nothing
   typed behind it shows.
 - **Ctrl+C**, **Enter** or **double-click** copies the image to the clipboard and closes.
-  **Ctrl+P** or the pin button copies it and pins it on screen. **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** records the selection as a GIF.
+  **Ctrl+P** or the pin button copies it and pins it on screen. **Ctrl+S** saves a PNG. **Ctrl+Z / Ctrl+Y** undo/redo. **G** (or the GIF / MP4 button) records the selection; **Tab** switches between GIF and MP4.
   **Esc** closes. **Right-click** steps back (cancels tool, then selection, then closes).
 
 ### Pinned captures
@@ -106,37 +110,60 @@ you can compare it with the screen as it changes (or with another pin):
 - **Ctrl+C** copies it, **Ctrl+S** saves it, **Esc** or **double-click** closes it. On Windows,
   **right-click** opens a menu with these, edit, opacity presets and "Close all pins"; on Linux it
   shows the controls again.
-- Pins hide while you take a new capture, so they don't end up in it. (GIF recordings show them.)
+- Pins hide while you take a new capture, so they don't end up in it. (Recordings show them.)
 
 **Recent captures** in the tray menu lists the last 10 captures (copied, saved or pinned) with
 thumbnails; click one to pin it again. The history is kept in memory only: it's gone when the app
 exits, and "Clear history" empties it right away.
 
-### GIFs
+### Recordings (GIF or MP4)
+
+Recordings are saved as an animated **GIF** or an **MP4** video. Choose in the tray menu
+(**Recording format**), or press **Tab** in the editor or while selecting the area after
+Shift+PrtSc; the record button and the hint show the current format. The choice is remembered.
+Everything else works the same in both formats:
 
 - Annotations drawn before pressing **G** are burned into every frame, so you can, for example,
   pixelate a private area or point an arrow at something during a recording.
 - A red frame marks the recorded area. The floating bar shows the time and has **Stop** and
   **discard** buttons (drag it by its background if it's in the way). It's excluded from the
   recording.
-- GIFs are saved to `Pictures\Screen Capture\` (`~/Pictures/Screen Capture/` on Linux) and put on
-  the clipboard as a file, so they paste (still animated) into a file manager, Slack, Discord,
-  Teams, e-mail and so on. Click the notification to show the file.
+- Recordings are saved to `Pictures\Screen Capture\` (`~/Pictures/Screen Capture/` on Linux) and
+  put on the clipboard as a file, so they paste (still animated) into a file manager, Slack,
+  Discord, Teams, e-mail and so on. Click the notification to show the file.
 - Frame rate (10–30 fps) and whether the mouse cursor is recorded are in the tray menu.
-- Encoding: unchanged frames are merged, and each frame stores only the changed rectangle,
-  with unchanged pixels transparent. Each frame gets its own palette, and quantization runs in
-  parallel. Typical UI recordings stay small.
+- Unchanged frames are merged: a frame stays up until something changes. Frames that can't be
+  encoded as fast as they're captured are finished after Stop, with progress in the bar.
+
+**GIF** plays anywhere an image does and loops. Each frame stores only the changed rectangle,
+with unchanged pixels transparent; each frame gets its own palette, and quantization runs in
+parallel. Typical UI recordings stay small.
+
+**MP4** (H.264) keeps full color and is usually many times smaller, especially with motion,
+scrolling or photos. It plays in browsers, chat apps and video players, with the index at the
+start so it can stream.
+
+- **Windows** uses the H.264 encoder built into Windows (the graphics card's, where it has one),
+  so nothing is bundled. Windows "N" editions need Microsoft's Media Feature Pack for MP4; GIFs
+  work without it.
+- **Linux** uses OpenH264, built into the app.
+- H.264 needs even sizes and has limits, so an odd width or height loses its last pixel, areas
+  under 34 px (16 px on Linux) are enlarged by a whole factor, and areas over 4096 × 2304
+  (3840 × 2160 on Linux; turned for portrait) are scaled down. The notification shows the size
+  stored.
 
 ### Tray menu
 
-Capture, Capture and pin, Record GIF, Recent captures, Close all pins (when there are any), GIF
-frame rate, cursor in GIFs, open the GIF folder, **Start with Windows** /
+Capture, Capture and pin, Record GIF / MP4, Recent captures, Close all pins (when there are any),
+**Recording format** (GIF or MP4), recording frame rate, cursor in recordings, open the recordings
+folder, **Start with Windows** /
 **Start at login** (registers the executable's current path; move it to its final location
 first), About (version, links to Pixobit Solutions and the source code), Exit.
 
-Command line: `screen-capture --capture`, `--pin` or `--gif` triggers a capture in the running
-instance (handy for binding to another key or a shortcut). Like PrtSc, `--capture` during a recording
-stops it; on Linux, `--stop` does only that.
+Command line: `screen-capture --capture`, `--pin` or `--record` triggers a capture in the running
+instance (handy for binding to another key or a shortcut). `--record` records in the chosen
+format; `--gif`, its name before MP4, still works and does the same. Like PrtSc, `--capture` during
+a recording stops it; on Linux, `--stop` does only that.
 
 Settings: `%APPDATA%\screen-capture\settings.ini` on Windows,
 `~/.config/screen-capture/settings.ini` on Linux.
@@ -149,7 +176,7 @@ Everything above works the same on X11 and Wayland, with these differences.
 (GNOME, KDE, XFCE, Cinnamon, openbox's default config…); then the app says so on startup, and you
 can free the key or bind another one in the desktop's keyboard settings to
 `screen-capture --capture` (and Ctrl+PrtSc to `screen-capture --pin`, Shift+PrtSc to
-`screen-capture --gif`). Pins stay on top, and Ctrl+wheel opacity works with a compositing window
+`screen-capture --record`). Pins stay on top, and Ctrl+wheel opacity works with a compositing window
 manager (GNOME, KDE, XFCE with compositing, picom…).
 
 **Wayland** doesn't let apps read the screen or grab keys directly, so the app goes through the
@@ -164,10 +191,10 @@ desktop portals (`xdg-desktop-portal` plus your desktop's backend):
   ```
   bindsym Print exec screen-capture --capture
   bindsym Ctrl+Print exec screen-capture --pin
-  bindsym Shift+Print exec screen-capture --gif
+  bindsym Shift+Print exec screen-capture --record
   ```
 
-- **GIF recording** uses the ScreenCast portal and PipeWire. The first recording asks which
+- **Recording** uses the ScreenCast portal and PipeWire. The first recording asks which
   screen to share; the choice is remembered.
 - Wayland doesn't tell apps where windows are, so **a click selects the whole screen** instead of
   a window. The overlay covers one monitor (the primary one), and the recording bar is placed by
@@ -185,7 +212,8 @@ desktop portals (`xdg-desktop-portal` plus your desktop's backend):
 Debug builds include a non-interactive self-test that captures the screen, renders the overlay
 offscreen, checks text editing, drawing, pin mode, pin zoom and opacity (on Windows with a real,
 off-screen pin window), the history, outlines and pixelate (including an attack that tries to
-read pixelated passwords back), encodes and re-decodes GIFs, and writes the results to a folder:
+read pixelated passwords back), encodes GIFs and MP4s (synthetic and from the screen; odd, tiny
+and huge sizes; cancelling) and checks the files, and writes the results to a folder:
 
 ```sh
 cargo run -- --selftest out [photo-tests-dir]
@@ -203,13 +231,15 @@ Linux debug builds also have `--dump-screen <file.png>` (save the X screen), `--
 | `editor.rs` | The overlay: selection, toolbars, magnifier, annotation editing; platform-neutral |
 | `annotate.rs` | Shapes and their rasterization (tiny-skia), safe pixelate |
 | `ocr.rs` | Shared OCR preparation and word/line merging for pixelate |
+| `recording.rs` | Recording formats, frames and results; picks the encoder |
 | `gif_enc.rs` | GIF encoder (frame diffing, quantization, parallel LZW) |
+| `mp4_enc.rs` | MP4: frame timing, H.264 size limits, YUV conversion, moving the index to the front; each platform supplies the H.264 writer |
 | `recbar.rs` | The recording bar, drawn the same on both platforms |
 | `pin.rs` | A pinned capture's zoom, opacity, labels and drawing; each platform's window feeds it input |
 | `history.rs` | The last 10 captures, compressed in memory, for the tray menu |
 | `text.rs`, `ui.rs`, `icon.rs` | Font rendering, UI drawing and icons, app icon |
-| `win/` | Windows: tray, PrtSc keyboard hook, overlay and pin windows, GDI capture, clipboard, WinRT OCR, recording |
-| `linux/` | Linux: tray (StatusNotifierItem), X11 key grab and capture, portals, pin windows, PipeWire recording, Tesseract OCR, dialogs |
+| `win/` | Windows: tray, PrtSc keyboard hook, overlay and pin windows, GDI capture, clipboard, WinRT OCR, recording, Media Foundation MP4 writer |
+| `linux/` | Linux: tray (StatusNotifierItem), X11 key grab and capture, portals, pin windows, PipeWire recording, OpenH264 MP4 writer, Tesseract OCR, dialogs |
 
 ## About
 

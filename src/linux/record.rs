@@ -1,4 +1,4 @@
-//! A GIF recording session on Linux: frames from X11 or from a Wayland
+//! A recording session (GIF or MP4) on Linux: frames from X11 or from a Wayland
 //! screen cast (PipeWire), the shared encoder, and the control bar. On X11,
 //! where windows can be placed exactly, a red frame also marks the area.
 
@@ -24,17 +24,17 @@ use super::capture::Grabber;
 use super::portal::Cast;
 use super::UserEvent;
 use crate::annotate;
-use crate::editor::GifRequest;
-use crate::gif_enc::{self, GifInfo, Msg};
+use crate::editor::RecordRequest;
 use crate::recbar::{self, BarBtn, BarState};
+use crate::recording::{self, Format, Msg, RecInfo};
 use crate::text::Fonts;
 use crate::ui::Canvas;
 use crate::util::Rect;
 
 /// Sent through the event loop when encoding ends.
-pub struct GifOutcome {
+pub struct RecordOutcome {
     pub id: u64,
-    pub result: Result<GifInfo, String>,
+    pub result: Result<RecInfo, String>,
 }
 
 pub enum Source {
@@ -86,6 +86,7 @@ impl Panel {
 
 pub struct Recording {
     pub id: u64,
+    pub format: Format,
     shared: Arc<Shared>,
     bar: Option<Panel>,
     borders: Vec<Panel>,
@@ -101,14 +102,14 @@ impl Recording {
         el: &ActiveEventLoop,
         proxy: EventLoopProxy<UserEvent>,
         id: u64,
-        req: GifRequest,
+        req: RecordRequest,
         fps: u32,
         cursor: bool,
         fonts: Arc<Fonts>,
         out: PathBuf,
         source: Source,
     ) -> Recording {
-        let r = req.region;
+        let (r, format) = (req.region, req.format);
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
@@ -132,7 +133,7 @@ impl Recording {
 
         let (bw, bh) = recbar::size(scale, &fonts);
         let mut bar_attrs = Window::default_attributes()
-            .with_title("Recording GIF")
+            .with_title(format!("Recording {}", format.label()))
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
@@ -202,11 +203,11 @@ impl Recording {
                     annotate::render(bytemuck::cast_slice_mut(px), w, h, &shapes, 0.0, 0.0, &enc_fonts);
                 }
             };
-            let result = gif_enc::encode(rx, w, h, overlay, &out, &sh.cancel, &sh.processed);
-            let _ = proxy.send_event(UserEvent::RecordingDone(GifOutcome { id, result }));
+            let result = recording::encode(format, rx, w, h, fps, overlay, &out, &sh.cancel, &sh.processed);
+            let _ = proxy.send_event(UserEvent::RecordingDone(RecordOutcome { id, result }));
         });
 
-        Recording { id, shared, bar, borders, stop_cast, fonts, scale, hover: None }
+        Recording { id, format, shared, bar, borders, stop_cast, fonts, scale, hover: None }
     }
 
     pub fn is_capturing(&self) -> bool {
@@ -260,6 +261,7 @@ impl Recording {
             elapsed_ms: self.shared.start.elapsed().as_millis() as u64,
             frames: self.shared.frames.load(Relaxed),
             processed: self.shared.processed.load(Relaxed),
+            format: self.format,
         };
         let fonts = self.fonts.clone();
         let bar = self.bar.as_mut()?;
@@ -298,9 +300,9 @@ impl Recording {
 }
 
 /// Debug aid for testing on Wayland: records `secs` of an area from a screen
-/// cast, without any windows.
+/// cast, without any windows (in the format `out`'s extension names).
 #[cfg(debug_assertions)]
-pub fn record_cast_for_test(cast: Cast, region: Rect, screen: (i32, i32), secs: f32, out: &std::path::Path) -> Result<GifInfo, String> {
+pub fn record_cast_for_test(cast: Cast, region: Rect, screen: (i32, i32), secs: f32, out: &std::path::Path) -> Result<RecInfo, String> {
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         cancel: AtomicBool::new(false),
@@ -317,7 +319,8 @@ pub fn record_cast_for_test(cast: Cast, region: Rect, screen: (i32, i32), secs: 
         thread::sleep(Duration::from_secs_f32(secs));
         sh.stop.store(true, Relaxed);
     });
-    let result = gif_enc::encode(rx, region.w(), region.h(), |_| {}, out, &shared.cancel, &shared.processed);
+    let format = out.extension().and_then(|e| Format::from_key(&e.to_string_lossy())).unwrap_or_default();
+    let result = recording::encode(format, rx, region.w(), region.h(), 10, |_| {}, out, &shared.cancel, &shared.processed);
     let _ = stop.send(());
     result
 }
@@ -461,7 +464,7 @@ fn run_stream(
         &mut params,
     )?;
 
-    // The sampler turns the latest frame into GIF frames on a steady clock
+    // The sampler turns the latest frame into recorded frames on a steady clock
     // (the compositor only sends frames when the screen changes) and quits
     // the PipeWire loop when the recording stops.
     let (quit_tx, quit_rx) = pw::channel::channel::<()>();

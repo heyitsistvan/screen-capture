@@ -1,5 +1,5 @@
-//! A GIF recording session: the capture thread, the encoder thread, the red
-//! frame around the recorded area and the floating control bar.
+//! A recording session (GIF or MP4): the capture thread, the encoder thread,
+//! the red frame around the recorded area and the floating control bar.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -28,22 +28,22 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::annotate;
 use super::capture::{Dib, Grabber};
-use crate::editor::GifRequest;
-use crate::gif_enc::{self, GifInfo, Msg};
+use crate::editor::RecordRequest;
 use crate::recbar::{self, BarBtn, BarState};
+use crate::recording::{self, Format, Msg, RecInfo};
 use crate::text::Fonts;
 use crate::ui::Canvas;
 use crate::util::{self, wide, Rect};
-use super::{WM_APP_CANCEL_GIF, WM_APP_GIF_DONE, WM_APP_STOP_GIF};
+use super::{WM_APP_CANCEL_REC, WM_APP_REC_DONE, WM_APP_STOP_REC};
 
 const BORDER_CLASS: &str = "ScreenCaptureRecBorder";
 const BAR_CLASS: &str = "ScreenCaptureRecBar";
 
 
 /// Posted to the main window (boxed, in LPARAM) when encoding ends.
-pub struct GifOutcome {
+pub struct RecordOutcome {
     pub id: u64,
-    pub result: Result<GifInfo, String>,
+    pub result: Result<RecInfo, String>,
 }
 
 struct Shared {
@@ -53,10 +53,12 @@ struct Shared {
     processed: AtomicUsize,
     start: Instant,
     elapsed_ms: AtomicU64,
+    format: Format,
 }
 
 pub struct Recording {
     pub id: u64,
+    pub format: Format,
     shared: Arc<Shared>,
     borders: Vec<HWND>,
     bar: HWND,
@@ -88,13 +90,13 @@ impl Recording {
     pub fn start(
         main: HWND,
         id: u64,
-        req: GifRequest,
+        req: RecordRequest,
         fps: u32,
         cursor: bool,
         fonts: Arc<Fonts>,
         out: PathBuf,
     ) -> Recording {
-        let r = req.region;
+        let (r, format) = (req.region, req.format);
         let (cx, cy) = r.center();
         let scale = util::dpi_scale_at(cx, cy);
         let shared = Arc::new(Shared {
@@ -104,6 +106,7 @@ impl Recording {
             processed: AtomicUsize::new(0),
             start: Instant::now(),
             elapsed_ms: AtomicU64::new(0),
+            format,
         });
         let th = ((2.0 * scale).round() as i32).max(2);
         let borders = unsafe { create_borders(r, th) };
@@ -123,16 +126,16 @@ impl Recording {
                     annotate::render(bytemuck::cast_slice_mut(px), w, h, &shapes, 0.0, 0.0, &fonts);
                 }
             };
-            let result = gif_enc::encode(rx, w, h, overlay, &out, &sh.cancel, &sh.processed);
-            let outcome = Box::into_raw(Box::new(GifOutcome { id, result }));
+            let result = recording::encode(format, rx, w, h, fps, overlay, &out, &sh.cancel, &sh.processed);
+            let outcome = Box::into_raw(Box::new(RecordOutcome { id, result }));
             unsafe {
-                if PostMessageW(main_addr as HWND, WM_APP_GIF_DONE, 0, outcome as LPARAM) == 0 {
+                if PostMessageW(main_addr as HWND, WM_APP_REC_DONE, 0, outcome as LPARAM) == 0 {
                     drop(Box::from_raw(outcome));
                 }
             }
         });
 
-        Recording { id, shared, borders, bar }
+        Recording { id, format, shared, borders, bar }
     }
 
     pub fn is_capturing(&self) -> bool {
@@ -264,6 +267,7 @@ unsafe fn create_bar(main: HWND, r: Rect, th: i32, scale: f32, shared: Arc<Share
         }
     }
     let x = (r.r - bw).min(mon.r - bw).max(mon.l);
+    let title = wide(&format!("Recording {}", shared.format.label()));
 
     let bar = Box::into_raw(Box::new(Bar {
         main,
@@ -277,7 +281,7 @@ unsafe fn create_bar(main: HWND, r: Rect, th: i32, scale: f32, shared: Arc<Share
         tracking: false,
     }));
     let cls = wide(BAR_CLASS);
-    let title = wide("Recording GIF");
+
     let h = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         cls.as_ptr(),
@@ -320,6 +324,7 @@ impl Bar {
             elapsed_ms: self.shared.start.elapsed().as_millis() as u64,
             frames: self.shared.frames.load(Relaxed),
             processed: self.shared.processed.load(Relaxed),
+            format: self.shared.format,
         };
         let (w, h, scale, hover) = (self.w, self.h, self.scale, self.hover);
         let fonts = self.fonts.clone();
@@ -398,8 +403,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_LBUTTONUP => {
             if let Some(b) = bar.hit(x, y) {
                 let m = match b {
-                    BarBtn::Stop => WM_APP_STOP_GIF,
-                    BarBtn::Cancel => WM_APP_CANCEL_GIF,
+                    BarBtn::Stop => WM_APP_STOP_REC,
+                    BarBtn::Cancel => WM_APP_CANCEL_REC,
                 };
                 PostMessageW(bar.main, m, 0, 0);
             }

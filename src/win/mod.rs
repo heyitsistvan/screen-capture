@@ -1,12 +1,13 @@
 //! The Windows app: tray icon, PrtSc keyboard hook, the editor window, pinned
-//! captures, the recent-captures history and GIF recording.
+//! captures, the recent-captures history and GIF/MP4 recording.
 
 pub mod capture;
 pub mod clipboard;
-pub mod gif_rec;
+pub mod mp4;
 pub mod ocr;
 pub mod overlay;
 pub mod pin;
+pub mod record;
 pub mod tray;
 
 use std::cell::RefCell;
@@ -43,23 +44,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::annotate::Shape;
-use crate::editor::{GifRequest, Mode};
+use crate::editor::{Mode, RecordRequest};
 use crate::history::{self, History};
-use self::gif_rec::{GifOutcome, Recording};
+use self::record::{RecordOutcome, Recording};
+use crate::recording::{self, Format};
 use crate::settings::{Settings, FPS_CHOICES};
 use crate::text::Fonts;
 use crate::util::wide;
-use crate::{editor, gif_enc, settings, util};
+use crate::{editor, settings, util};
 #[cfg(debug_assertions)]
 use crate::selftest;
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_HOTKEY: u32 = WM_APP + 2;
 pub const WM_APP_OVERLAY_DONE: u32 = WM_APP + 3;
-pub const WM_APP_START_GIF: u32 = WM_APP + 4;
-pub const WM_APP_STOP_GIF: u32 = WM_APP + 5;
-pub const WM_APP_CANCEL_GIF: u32 = WM_APP + 6;
-pub const WM_APP_GIF_DONE: u32 = WM_APP + 7;
+/// Start recording (`lparam`: `Box<RecordRequest>`).
+pub const WM_APP_START_REC: u32 = WM_APP + 4;
+pub const WM_APP_STOP_REC: u32 = WM_APP + 5;
+pub const WM_APP_CANCEL_REC: u32 = WM_APP + 6;
+/// Encoding ended (`lparam`: `Box<RecordOutcome>`).
+pub const WM_APP_REC_DONE: u32 = WM_APP + 7;
 /// A finished capture (`lparam`: `Box<Captured>`): goes into the history,
 /// and is pinned if asked.
 pub const WM_APP_CAPTURED: u32 = WM_APP + 8;
@@ -75,10 +79,8 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
 const MAIN_CLASS: &str = "ScreenCaptureMain";
 const TIMER_DELAYED_CAPTURE: usize = 1;
-const TIP_IDLE: &str = "Screen Capture\nPrtSc: capture · Ctrl+PrtSc: pin · Shift+PrtSc: GIF";
-
 const ID_CAPTURE: usize = 1;
-const ID_GIF: usize = 2;
+const ID_RECORD: usize = 2;
 const ID_STOP: usize = 3;
 const ID_OPEN_FOLDER: usize = 4;
 const ID_AUTOSTART: usize = 5;
@@ -90,6 +92,8 @@ const ID_PIN: usize = 10;
 const ID_CLEAR_HISTORY: usize = 11;
 const ID_CLOSE_PINS: usize = 12;
 const ID_FPS: usize = 100;
+/// Recording formats, in `Format::ALL` order.
+const ID_FORMAT: usize = 150;
 /// Recent captures, by their position in the menu.
 const ID_HISTORY: usize = 200;
 
@@ -119,18 +123,23 @@ pub struct EditPin {
     pub at: (i32, i32),
 }
 
-/// `WM_APP_HOTKEY`'s `wparam` (also sent by `--capture`, `--gif`, `--pin`).
+/// The tray icon's tooltip when not recording.
+fn tip_idle(format: Format) -> String {
+    format!("Screen Capture\nPrtSc: capture · Ctrl+PrtSc: pin · Shift+PrtSc: record {}", format.label())
+}
+
+/// `WM_APP_HOTKEY`'s `wparam` (also sent by `--capture`, `--record`, `--pin`).
 fn mode_to_wparam(mode: Mode) -> usize {
     match mode {
         Mode::Capture => 0,
-        Mode::Gif => 1,
+        Mode::Record => 1,
         Mode::Pin | Mode::EditPin => 2,
     }
 }
 
 fn mode_from_wparam(wp: usize) -> Mode {
     match wp {
-        1 => Mode::Gif,
+        1 => Mode::Record,
         2 => Mode::Pin,
         _ => Mode::Capture,
     }
@@ -149,7 +158,8 @@ struct App {
     next_rec_id: u64,
     icon: HICON,
     icon_rec: HICON,
-    last_gif: Option<PathBuf>,
+    /// The last recording saved, shown when its notification is clicked.
+    last_recording: Option<PathBuf>,
     pending_mode: Mode,
     pins: Vec<HWND>,
     /// Pins are hidden while the editor is open, so new captures don't
@@ -178,8 +188,9 @@ pub fn run() {
         let dir = args.get(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("selftest-out"));
         std::process::exit(selftest::run(&dir, args.get(2).map(Path::new)));
     }
-    let request: Option<usize> = if args.iter().any(|a| a == "--gif") {
-        Some(mode_to_wparam(Mode::Gif))
+    // --gif is the old name of --record (it records in the chosen format too).
+    let request: Option<usize> = if args.iter().any(|a| a == "--record" || a == "--gif") {
+        Some(mode_to_wparam(Mode::Record))
     } else if args.iter().any(|a| a == "--pin") {
         Some(mode_to_wparam(Mode::Pin))
     } else if args.iter().any(|a| a == "--capture") {
@@ -218,6 +229,7 @@ pub fn run() {
     let first_run = !Settings::exists();
     let settings = Settings::load();
     editor::apply_outline_setting(&settings.outline);
+    editor::set_record_format(settings.format);
     if first_run {
         settings.save();
     }
@@ -233,7 +245,7 @@ pub fn run() {
         RegisterClassExW(&wc);
         overlay::register_class(hinst);
         pin::register_class(hinst);
-        gif_rec::register_classes(hinst);
+        record::register_classes(hinst);
 
         // A hidden top-level window (not message-only) so it receives the
         // TaskbarCreated broadcast and can own the tray menu.
@@ -273,14 +285,14 @@ pub fn run() {
                 next_rec_id: 0,
                 icon,
                 icon_rec,
-                last_gif: None,
+                last_recording: None,
                 pending_mode: Mode::Capture,
                 pins: Vec::new(),
                 pins_hidden: false,
                 history: History::default(),
             })
         });
-        tray::add(hwnd, WM_APP_TRAY, icon, TIP_IDLE);
+        tray::add(hwnd, WM_APP_TRAY, icon, &tip_idle(record_format()));
         spawn_hook_thread();
 
         if let Some(r) = request {
@@ -289,7 +301,7 @@ pub fn run() {
             tray::balloon(
                 hwnd,
                 "Screen Capture is running",
-                "Press PrtSc to capture an area, Ctrl+PrtSc to pin it on screen, Shift+PrtSc to record a GIF.",
+                "Press PrtSc to capture an area, Ctrl+PrtSc to pin it on screen, Shift+PrtSc to record it (GIF or MP4).",
                 false,
             );
         }
@@ -357,7 +369,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LR
                         let mode = if held(VK_CONTROL) {
                             Mode::Pin
                         } else if held(VK_SHIFT) {
-                            Mode::Gif
+                            Mode::Record
                         } else {
                             Mode::Capture
                         };
@@ -386,14 +398,17 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if a.overlay as usize == wp {
                     a.overlay = null_mut();
                 }
-                // Remember the outline choice across restarts.
-                let outline = editor::outline_setting();
-                if outline != a.settings.outline {
+                // Remember the outline and recording format (Tab in the
+                // editor) across restarts.
+                let (outline, format) = (editor::outline_setting(), editor::record_format());
+                if outline != a.settings.outline || format != a.settings.format {
                     a.settings.outline = outline;
+                    a.settings.format = format;
                     a.settings.save();
                 }
             });
             show_pins(true);
+            refresh_tip();
         }
         WM_APP_CAPTURED => captured(*Box::from_raw(lp as *mut Captured)),
         WM_APP_HISTORY_ADD => {
@@ -403,10 +418,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_APP_PIN_CLOSED => with_app(|a| a.pins.retain(|&p| p as WPARAM != wp)),
         WM_APP_CLOSE_PINS => close_pins(),
         WM_APP_EDIT_PIN => edit_pin(wp as HWND),
-        WM_APP_START_GIF => start_gif(*Box::from_raw(lp as *mut GifRequest)),
-        WM_APP_STOP_GIF => stop_gif(),
-        WM_APP_CANCEL_GIF => cancel_gif(),
-        WM_APP_GIF_DONE => gif_done(*Box::from_raw(lp as *mut GifOutcome)),
+        WM_APP_START_REC => start_recording(*Box::from_raw(lp as *mut RecordRequest)),
+        WM_APP_STOP_REC => stop_recording(),
+        WM_APP_CANCEL_REC => cancel_recording(),
+        WM_APP_REC_DONE => recording_done(*Box::from_raw(lp as *mut RecordOutcome)),
         WM_DESTROY => {
             let (overlay, rec) = with_app(|a| (a.overlay, a.rec.take()));
             if let Some(mut r) = rec {
@@ -423,7 +438,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             // Explorer restarted: the tray icon must be re-added.
             let (icon, recording) = with_app(|a| (a.icon, a.rec.is_some()));
             let icon = if recording { with_app(|a| a.icon_rec) } else { icon };
-            tray::add(hwnd, WM_APP_TRAY, icon, TIP_IDLE);
+            tray::add(hwnd, WM_APP_TRAY, icon, &tip_idle(record_format()));
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -434,16 +449,29 @@ fn is_capturing() -> bool {
     with_app(|a| a.rec.as_ref().is_some_and(|r| r.is_capturing()))
 }
 
+fn record_format() -> Format {
+    with_app(|a| a.settings.format)
+}
+
+/// Shows the idle tooltip (it names the recording format), unless a
+/// recording is going on.
+fn refresh_tip() {
+    let (main, icon, busy, format) = with_app(|a| (a.hwnd, a.icon, a.rec.is_some(), a.settings.format));
+    if !busy {
+        tray::set(main, icon, &tip_idle(format));
+    }
+}
+
 fn on_hotkey(mode: Mode) {
     if is_capturing() {
-        stop_gif();
+        stop_recording();
         return;
     }
     let overlay = with_app(|a| a.overlay);
     if !overlay.is_null() && unsafe { IsWindow(overlay) } != 0 {
         return;
     }
-    if mode == Mode::Gif && with_app(|a| a.rec.is_some()) {
+    if mode == Mode::Record && with_app(|a| a.rec.is_some()) {
         notify_busy();
         return;
     }
@@ -554,21 +582,21 @@ fn pin_history(id: u64) {
 
 fn notify_busy() {
     let main = with_app(|a| a.hwnd);
-    tray::balloon(main, "Still encoding the previous GIF", "Try again in a moment.", false);
+    tray::balloon(main, "Still encoding the previous recording", "Try again in a moment.", false);
 }
 
 fn on_tray(hwnd: HWND, lp: LPARAM) {
     match (lp & 0xFFFF) as u32 {
         NIN_SELECT | NIN_KEYSELECT => {
             if is_capturing() {
-                stop_gif();
+                stop_recording();
             } else {
                 schedule_capture(hwnd, Mode::Capture);
             }
         }
         WM_CONTEXTMENU => unsafe { show_menu(hwnd) },
         NIN_BALLOONUSERCLICK => {
-            if let Some(p) = with_app(|a| a.last_gif.clone()) {
+            if let Some(p) = with_app(|a| a.last_recording.clone()) {
                 show_in_folder(&p);
             }
         }
@@ -622,8 +650,9 @@ unsafe fn history_menu() -> (HMENU, Vec<u64>, Vec<HBITMAP>) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let (capturing, fps, cursor, has_history, pins) = with_app(|a| {
-        (a.rec.as_ref().is_some_and(|r| r.is_capturing()), a.settings.fps, a.settings.cursor, !a.history.is_empty(), a.pins.len())
+    let (capturing, fps, cursor, format, has_history, pins) = with_app(|a| {
+        let capturing = a.rec.as_ref().is_some_and(|r| r.is_capturing());
+        (capturing, a.settings.fps, a.settings.cursor, a.settings.format, !a.history.is_empty(), a.pins.len())
     });
     let autostart = settings::autostart_enabled();
 
@@ -635,9 +664,9 @@ unsafe fn show_menu(hwnd: HWND) {
     item(menu, ID_CAPTURE, "Capture area\tPrtSc", false);
     item(menu, ID_PIN, "Capture and pin\tCtrl+PrtSc", false);
     if capturing {
-        item(menu, ID_STOP, "Stop GIF recording\tPrtSc", false);
+        item(menu, ID_STOP, "Stop recording\tPrtSc", false);
     } else {
-        item(menu, ID_GIF, "Record GIF\tShift+PrtSc", false);
+        item(menu, ID_RECORD, &format!("Record {}\tShift+PrtSc", format.label()), false);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     let mut history_ids = Vec::new();
@@ -655,14 +684,20 @@ unsafe fn show_menu(hwnd: HWND) {
         item(menu, ID_CLOSE_PINS, &if pins == 1 { "Close the pin".to_string() } else { format!("Close all {pins} pins") }, false);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    let format_menu = CreatePopupMenu();
+    for (i, f) in Format::ALL.iter().enumerate() {
+        item(format_menu, ID_FORMAT + i, f.label(), *f == format);
+    }
+    let label = wide("Recording format");
+    AppendMenuW(menu, MF_POPUP, format_menu as usize, label.as_ptr());
     let fps_menu = CreatePopupMenu();
     for (i, f) in FPS_CHOICES.iter().enumerate() {
         item(fps_menu, ID_FPS + i, &format!("{f} fps"), *f == fps);
     }
-    let label = wide("GIF frame rate");
+    let label = wide("Recording frame rate");
     AppendMenuW(menu, MF_POPUP, fps_menu as usize, label.as_ptr());
-    item(menu, ID_CURSOR, "Show mouse cursor in GIFs", cursor);
-    item(menu, ID_OPEN_FOLDER, "Open GIF folder", false);
+    item(menu, ID_CURSOR, "Show mouse cursor in recordings", cursor);
+    item(menu, ID_OPEN_FOLDER, "Open recordings folder", false);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     item(menu, ID_AUTOSTART, "Start with Windows", autostart);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -696,8 +731,8 @@ unsafe fn on_command(hwnd: HWND, cmd: usize) {
     match cmd {
         ID_CAPTURE => schedule_capture(hwnd, Mode::Capture),
         ID_PIN => schedule_capture(hwnd, Mode::Pin),
-        ID_GIF => schedule_capture(hwnd, Mode::Gif),
-        ID_STOP => stop_gif(),
+        ID_RECORD => schedule_capture(hwnd, Mode::Record),
+        ID_STOP => stop_recording(),
         ID_CLEAR_HISTORY => with_app(|a| a.history.clear()),
         ID_CLOSE_PINS => close_pins(),
         ID_CURSOR => with_app(|a| {
@@ -724,6 +759,15 @@ unsafe fn on_command(hwnd: HWND, cmd: usize) {
             a.settings.fps = FPS_CHOICES[c - ID_FPS];
             a.settings.save();
         }),
+        c if (ID_FORMAT..ID_FORMAT + Format::ALL.len()).contains(&c) => {
+            let format = Format::ALL[c - ID_FORMAT];
+            with_app(|a| {
+                a.settings.format = format;
+                a.settings.save();
+            });
+            editor::set_record_format(format);
+            refresh_tip();
+        }
         _ => {}
     }
 }
@@ -747,7 +791,7 @@ fn show_in_folder(path: &Path) {
     unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), exe.as_ptr(), args.as_ptr(), null(), SW_SHOWNORMAL) };
 }
 
-fn start_gif(req: GifRequest) {
+fn start_recording(req: RecordRequest) {
     if req.region.w() < 2 || req.region.h() < 2 {
         return;
     }
@@ -755,40 +799,44 @@ fn start_gif(req: GifRequest) {
         notify_busy();
         return;
     }
+    let format = req.format;
     let (main, fonts, fps, cursor, id) = with_app(|a| {
         a.next_rec_id += 1;
         (a.hwnd, a.fonts.clone(), a.settings.fps, a.settings.cursor, a.next_rec_id)
     });
     let dir = util::captures_dir();
-    let path = dir.join(format!("Recording_{}.gif", util::timestamp()));
+    let path = dir.join(recording::file_name(format, &util::timestamp()));
     let rec = Recording::start(main, id, req, fps, cursor, fonts, path);
     let icon = with_app(|a| {
         a.rec = Some(rec);
         a.icon_rec
     });
-    tray::set(main, icon, "Screen Capture\nRecording GIF — press PrtSc to stop");
+    tray::set(main, icon, &format!("Screen Capture\nRecording {} — press PrtSc to stop", format.label()));
 }
 
-fn stop_gif() {
-    let (main, icon) = with_app(|a| {
-        if let Some(r) = a.rec.as_mut() {
+fn stop_recording() {
+    let (main, icon, format) = with_app(|a| {
+        let format = a.rec.as_mut().map(|r| {
             r.stop();
-        }
-        (a.hwnd, a.icon)
+            r.format
+        });
+        (a.hwnd, a.icon, format)
     });
-    tray::set(main, icon, "Screen Capture\nEncoding GIF…");
+    if let Some(f) = format {
+        tray::set(main, icon, &format!("Screen Capture\nEncoding {}…", f.label()));
+    }
 }
 
-fn cancel_gif() {
-    let (rec, main, icon) = with_app(|a| (a.rec.take(), a.hwnd, a.icon));
+fn cancel_recording() {
+    let rec = with_app(|a| a.rec.take());
     if let Some(mut r) = rec {
         r.cancel();
     }
-    tray::set(main, icon, TIP_IDLE);
+    refresh_tip();
 }
 
-fn gif_done(out: GifOutcome) {
-    let (main, icon, current) = with_app(|a| (a.hwnd, a.icon, a.rec.as_ref().is_some_and(|r| r.id == out.id)));
+fn recording_done(out: RecordOutcome) {
+    let (main, current) = with_app(|a| (a.hwnd, a.rec.as_ref().is_some_and(|r| r.id == out.id)));
     if !current {
         // Cancelled while encoding finished: the user doesn't want the file.
         if let Ok(info) = out.result {
@@ -797,8 +845,9 @@ fn gif_done(out: GifOutcome) {
         return;
     }
     let rec = with_app(|a| a.rec.take());
+    let format = rec.as_ref().map_or(Format::Gif, |r| r.format);
     drop(rec);
-    tray::set(main, icon, TIP_IDLE);
+    refresh_tip();
     match out.result {
         Ok(info) => {
             clipboard::set_file(main, &info.path);
@@ -811,10 +860,10 @@ fn gif_done(out: GifOutcome) {
                 info.w,
                 info.h
             );
-            tray::balloon(main, "GIF saved", &text, false);
-            with_app(|a| a.last_gif = Some(info.path));
+            tray::balloon(main, &format!("{} saved", info.format.label()), &text, false);
+            with_app(|a| a.last_recording = Some(info.path));
         }
-        Err(e) if e == gif_enc::CANCELLED => {}
-        Err(e) => tray::balloon(main, "GIF recording failed", &e, true),
+        Err(e) if e == recording::CANCELLED => {}
+        Err(e) => tray::balloon(main, &format!("{} recording failed", format.label()), &e, true),
     }
 }

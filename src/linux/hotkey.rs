@@ -12,7 +12,7 @@ use crate::editor::Mode;
 
 const XK_PRINT: u32 = 0xff61;
 
-/// Grabs PrtSc, Ctrl+PrtSc (pin) and Shift+PrtSc (GIF) and calls
+/// Grabs PrtSc, Ctrl+PrtSc (pin) and Shift+PrtSc (record) and calls
 /// `on_press(mode)` from a background thread for each press. Fails only if
 /// plain PrtSc can't be had; returns the other combinations that another
 /// program already uses.
@@ -48,7 +48,7 @@ pub fn grab_print(on_press: impl Fn(Mode) + Send + 'static) -> Result<Vec<&'stat
                     on_press(if state & u16::from(ModMask::CONTROL) != 0 {
                         Mode::Pin
                     } else if state & u16::from(ModMask::SHIFT) != 0 {
-                        Mode::Gif
+                        Mode::Record
                     } else {
                         Mode::Capture
                     });

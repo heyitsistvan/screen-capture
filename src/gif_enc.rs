@@ -12,31 +12,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::Receiver;
 
 use color_quant::NeuQuant;
 use rayon::prelude::*;
 
-pub const CANCELLED: &str = "cancelled";
-
-pub enum Msg {
-    /// Pixels as little-endian BGRA words with alpha 255, and a timestamp in ms.
-    Frame(Vec<u32>, u64),
-    /// Recording stopped at this timestamp (ms).
-    End(u64),
-}
-
-#[derive(Debug)]
-pub struct GifInfo {
-    pub path: PathBuf,
-    pub bytes: u64,
-    pub frames: usize,
-    pub duration_ms: u64,
-    pub w: i32,
-    pub h: i32,
-}
+use crate::recording::{Format, Msg, RecInfo, CANCELLED};
 
 struct Job {
     left: u16,
@@ -53,6 +36,7 @@ struct Job {
 
 /// Encodes frames from `rx` until `Msg::End` (or the sender hangs up).
 /// `overlay` is applied to every frame before encoding (annotations).
+/// Called through [`crate::recording::encode`].
 pub fn encode(
     rx: Receiver<Msg>,
     w: i32,
@@ -61,13 +45,14 @@ pub fn encode(
     out: &Path,
     cancel: &AtomicBool,
     processed: &AtomicUsize,
-) -> Result<GifInfo, String> {
+) -> Result<RecInfo, String> {
     let part = out.with_extension("gif.part");
     let result = encode_to(&rx, w, h, &mut overlay, &part, cancel, processed)
         .and_then(|r| fs::rename(&part, out).map(|_| r).map_err(|e| format!("Cannot save {}: {e}", out.display())));
     match result {
-        Ok((frames, duration_ms)) => Ok(GifInfo {
+        Ok((frames, duration_ms)) => Ok(RecInfo {
             path: out.to_path_buf(),
+            format: Format::Gif,
             bytes: fs::metadata(out).map(|m| m.len()).unwrap_or(0),
             frames,
             duration_ms,

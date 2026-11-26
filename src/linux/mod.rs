@@ -1,11 +1,13 @@
 //! The Linux app: tray icon, PrtSc (an X11 key grab, or the Wayland
 //! GlobalShortcuts portal), single instance, the editor window, pinned
-//! captures, the recent-captures history and GIF recording. X11 and Wayland differ mainly in how pixels are captured:
-//! directly on X11, through desktop portals on Wayland.
+//! captures, the recent-captures history and GIF/MP4 recording. X11 and
+//! Wayland differ mainly in how pixels are captured: directly on X11, through
+//! desktop portals on Wayland.
 
 pub mod capture;
 mod dialogs;
 mod hotkey;
+pub mod mp4;
 mod notify;
 pub mod ocr;
 mod pin;
@@ -35,14 +37,14 @@ use winit::window::WindowId;
 
 use self::capture::X11;
 use self::pin::{PinEvent, PinWindow};
-use self::record::{GifOutcome, Recording, Source};
+use self::record::{RecordOutcome, Recording, Source};
 use self::tray::TrayModel;
 use self::window::EditorWindow;
 use crate::annotate::{Rgba, Shape};
-use crate::editor::{self, Action, GifRequest, Mode, Screen};
-use crate::gif_enc;
+use crate::editor::{self, Action, Mode, RecordRequest, Screen};
 use crate::history::{self, History};
 use crate::recbar::BarBtn;
+use crate::recording::{self, Format};
 use crate::settings::{self, Settings};
 use crate::text::Fonts;
 use crate::util::{self, Rect, APP_NAME};
@@ -51,7 +53,8 @@ use crate::util::{self, Rect, APP_NAME};
 pub enum Cmd {
     Capture,
     Pin,
-    Gif,
+    /// Record, in the chosen format.
+    Record,
     Stop,
     /// Pin a capture from the history again.
     PinHistory(u64),
@@ -60,6 +63,7 @@ pub enum Cmd {
     OpenFolder,
     ToggleCursor,
     SetFps(u32),
+    SetFormat(Format),
     ToggleAutostart,
     /// A web page from the About menu.
     OpenUrl(&'static str),
@@ -67,7 +71,7 @@ pub enum Cmd {
 }
 
 pub enum UserEvent {
-    /// PrtSc (Ctrl to pin, Shift for a GIF); Wayland may pass a focus token.
+    /// PrtSc (Ctrl to pin, Shift to record); Wayland may pass a focus token.
     Hotkey { mode: Mode, activation: Option<String> },
     Command(Cmd),
     /// A Wayland screenshot from the portal.
@@ -76,7 +80,7 @@ pub enum UserEvent {
     SaveTo(Option<Option<PathBuf>>),
     ColorChosen { color: Option<Option<Rgba>>, outline: bool },
     CastStarted(Result<portal::Cast, String>),
-    RecordingDone(GifOutcome),
+    RecordingDone(RecordOutcome),
     ShortcutsUnavailable(String),
     /// A finished capture, compressed for the history.
     HistoryAdd(history::Entry),
@@ -127,8 +131,8 @@ struct App {
     pending_save: Option<PendingSave>,
     dialog_open: bool,
     rec: Option<Recording>,
-    /// Wayland: a GIF waiting for the screen cast to start.
-    pending_gif: Option<(GifRequest, (i32, i32))>,
+    /// Wayland: a recording waiting for the screen cast to start.
+    pending_rec: Option<(RecordRequest, (i32, i32))>,
     next_rec_id: u64,
     next_tick: Instant,
     tray: Option<ksni::blocking::Handle<TrayModel>>,
@@ -176,7 +180,8 @@ pub fn run() {
     let request = args.iter().find_map(|a| match a.as_str() {
         "--capture" => Some("capture"),
         "--pin" => Some("pin"),
-        "--gif" => Some("gif"),
+        // --gif is the old name of --record (it records in the chosen format too).
+        "--record" | "--gif" => Some("record"),
         "--stop" => Some("stop"),
         _ => None,
     });
@@ -204,6 +209,7 @@ pub fn run() {
         settings.save();
     }
     editor::apply_outline_setting(&settings.outline);
+    editor::set_record_format(settings.format);
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(el) => el,
@@ -221,6 +227,7 @@ pub fn run() {
         recording: false,
         fps: settings.fps,
         cursor: settings.cursor,
+        format: settings.format,
         autostart: settings::autostart_enabled(),
         history: Vec::new(),
         pins: 0,
@@ -257,7 +264,7 @@ pub fn run() {
             Ok(taken) if !taken.is_empty() => notify::show(
                 "Some shortcuts aren't available",
                 &format!(
-                    "Another program uses {}. Use the tray icon, or bind other keys to “{1} --pin” and “{1} --gif”.",
+                    "Another program uses {}. Use the tray icon, or bind other keys to “{1} --pin” and “{1} --record”.",
                     taken.join(" and "),
                     exe()
                 ),
@@ -267,8 +274,8 @@ pub fn run() {
     }
 
     match request {
-        Some("gif") => {
-            let _ = proxy.send_event(UserEvent::Command(Cmd::Gif));
+        Some("record") => {
+            let _ = proxy.send_event(UserEvent::Command(Cmd::Record));
         }
         Some("pin") => {
             let _ = proxy.send_event(UserEvent::Command(Cmd::Pin));
@@ -278,7 +285,7 @@ pub fn run() {
         }
         None if first_run => notify::show(
             &format!("{APP_NAME} is running"),
-            "Press PrtSc to capture an area, Ctrl+PrtSc to pin it on screen, Shift+PrtSc to record a GIF.",
+            "Press PrtSc to capture an area, Ctrl+PrtSc to pin it on screen, Shift+PrtSc to record it (GIF or MP4).",
         ),
         None => {}
     }
@@ -292,7 +299,7 @@ pub fn run() {
         pending_save: None,
         dialog_open: false,
         rec: None,
-        pending_gif: None,
+        pending_rec: None,
         next_rec_id: 0,
         next_tick: Instant::now(),
         tray,
@@ -399,7 +406,7 @@ fn socket_path() -> PathBuf {
     }
 }
 
-/// Accepts commands from later instances (`--capture`, `--pin`, `--gif`,
+/// Accepts commands from later instances (`--capture`, `--pin`, `--record`,
 /// `--stop`).
 fn listen(proxy: EventLoopProxy<UserEvent>) {
     let path = socket_path();
@@ -414,7 +421,7 @@ fn listen(proxy: EventLoopProxy<UserEvent>) {
             let cmd = match line.trim() {
                 "capture" => Cmd::Capture,
                 "pin" => Cmd::Pin,
-                "gif" => Cmd::Gif,
+                "record" | "gif" => Cmd::Record,
                 "stop" => Cmd::Stop,
                 _ => continue,
             };
@@ -435,7 +442,8 @@ fn monitor_rect(m: &MonitorHandle) -> Rect {
 
 impl App {
     fn update_tray(&self) {
-        let (recording, fps, cursor) = (self.rec.as_ref().is_some_and(Recording::is_capturing), self.settings.fps, self.settings.cursor);
+        let recording = self.rec.as_ref().is_some_and(Recording::is_capturing);
+        let (fps, cursor, format) = (self.settings.fps, self.settings.cursor, self.settings.format);
         let history: Vec<_> = self.history.iter().map(|e| (e.id, e.label(), e.thumb_png.clone())).collect();
         let pins = self.pins.len();
         if let Some(t) = &self.tray {
@@ -443,6 +451,7 @@ impl App {
                 m.recording = recording;
                 m.fps = fps;
                 m.cursor = cursor;
+                m.format = format;
                 m.autostart = settings::autostart_enabled();
                 m.history = history.clone();
                 m.pins = pins;
@@ -451,15 +460,18 @@ impl App {
     }
 
     /// Closes the editor; its color, sizes and outline carry over, and the
-    /// outline choice is remembered across restarts.
+    /// outline and recording format (Tab in the editor) are remembered across
+    /// restarts.
     fn close_editor(&mut self) {
         self.editor = None;
         self.edit = None;
         self.show_pins(true);
-        let outline = editor::outline_setting();
-        if outline != self.settings.outline {
+        let (outline, format) = (editor::outline_setting(), editor::record_format());
+        if outline != self.settings.outline || format != self.settings.format {
             self.settings.outline = outline;
+            self.settings.format = format;
             self.settings.save();
+            self.update_tray();
         }
     }
 
@@ -473,14 +485,14 @@ impl App {
     /// PrtSc, the tray or `--capture`: open the editor (or stop a recording).
     fn begin_capture(&mut self, el: &ActiveEventLoop, mode: Mode, activation: Option<String>) {
         if self.rec.as_ref().is_some_and(Recording::is_capturing) {
-            self.stop_gif();
+            self.stop_recording();
             return;
         }
         if self.editor.is_some() || self.capturing {
             return;
         }
-        if mode == Mode::Gif && self.rec.is_some() {
-            notify::show("Still encoding the previous GIF", "Try again in a moment.");
+        if mode == Mode::Record && self.rec.is_some() {
+            notify::show("Still encoding the previous recording", "Try again in a moment.");
             return;
         }
         // Keep pins out of the new screenshot: hide them and give the screen a
@@ -731,12 +743,12 @@ impl App {
                 }
                 self.remember(w, h, px, at);
             }
-            Action::Gif => {
-                let req = ed.editor.gif_request();
+            Action::Record => {
+                let req = ed.editor.record_request();
                 let size = ed.editor.size();
                 self.close_editor();
                 if let Some(req) = req {
-                    self.start_gif(el, req, size);
+                    self.start_recording(el, req, size);
                 }
             }
             Action::ChooseColor | Action::ChooseOutlineColor => {
@@ -771,7 +783,7 @@ impl App {
             Some(None) => return, // cancelled: keep editing
             Some(Some(path)) => path,
             None => {
-                // No dialog program: save next to the GIFs and say where.
+                // No dialog program: save next to the recordings and say where.
                 let dir = util::captures_dir();
                 let _ = std::fs::create_dir_all(&dir);
                 dir.join(format!("Screenshot_{}.png", util::timestamp()))
@@ -818,9 +830,9 @@ impl App {
         }
     }
 
-    fn start_gif(&mut self, el: &ActiveEventLoop, req: GifRequest, screen: (i32, i32)) {
-        if self.rec.is_some() || self.pending_gif.is_some() {
-            notify::show("Still encoding the previous GIF", "Try again in a moment.");
+    fn start_recording(&mut self, el: &ActiveEventLoop, req: RecordRequest, screen: (i32, i32)) {
+        if self.rec.is_some() || self.pending_rec.is_some() {
+            notify::show("Still encoding the previous recording", "Try again in a moment.");
             return;
         }
         if req.region.w() < 2 || req.region.h() < 2 {
@@ -830,7 +842,7 @@ impl App {
             self.launch(el, req, Source::X11);
             return;
         }
-        self.pending_gif = Some((req, screen));
+        self.pending_rec = Some((req, screen));
         let token = Some(self.settings.screencast_token.clone()).filter(|t| !t.is_empty());
         let (cursor, proxy) = (self.settings.cursor, self.proxy.clone());
         portal::runtime().spawn(async move {
@@ -838,11 +850,11 @@ impl App {
         });
     }
 
-    fn launch(&mut self, el: &ActiveEventLoop, req: GifRequest, source: Source) {
+    fn launch(&mut self, el: &ActiveEventLoop, req: RecordRequest, source: Source) {
         self.next_rec_id += 1;
         let dir = util::captures_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("Recording_{}.gif", util::timestamp()));
+        let path = dir.join(recording::file_name(req.format, &util::timestamp()));
         let (fps, cursor) = (self.settings.fps, self.settings.cursor);
         self.rec =
             Some(Recording::start(el, self.proxy.clone(), self.next_rec_id, req, fps, cursor, self.fonts.clone(), path, source));
@@ -850,21 +862,21 @@ impl App {
         self.update_tray();
     }
 
-    fn stop_gif(&mut self) {
+    fn stop_recording(&mut self) {
         if let Some(r) = self.rec.as_mut() {
             r.stop();
         }
         self.update_tray();
     }
 
-    fn cancel_gif(&mut self) {
+    fn cancel_recording(&mut self) {
         if let Some(mut r) = self.rec.take() {
             r.cancel();
         }
         self.update_tray();
     }
 
-    fn gif_done(&mut self, out: GifOutcome) {
+    fn recording_done(&mut self, out: RecordOutcome) {
         if self.rec.as_ref().is_none_or(|r| r.id != out.id) {
             // Cancelled while encoding finished: the user doesn't want the file.
             if let Ok(info) = out.result {
@@ -872,7 +884,7 @@ impl App {
             }
             return;
         }
-        self.rec = None;
+        let format = self.rec.take().map_or(Format::Gif, |r| r.format);
         self.update_tray();
         match out.result {
             Ok(info) => {
@@ -887,10 +899,10 @@ impl App {
                     info.h,
                     if copied { " — copied to the clipboard" } else { "" }
                 );
-                notify::show_file("GIF saved", &body, &info.path);
+                notify::show_file(&format!("{} saved", info.format.label()), &body, &info.path);
             }
-            Err(e) if e == gif_enc::CANCELLED => {}
-            Err(e) => notify::show("GIF recording failed", &e),
+            Err(e) if e == recording::CANCELLED => {}
+            Err(e) => notify::show(&format!("{} recording failed", format.label()), &e),
         }
     }
 
@@ -899,8 +911,8 @@ impl App {
             // A short delay lets the tray menu close before the screenshot.
             Cmd::Capture => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Capture, None)),
             Cmd::Pin => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Pin, None)),
-            Cmd::Gif => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Gif, None)),
-            Cmd::Stop => self.stop_gif(),
+            Cmd::Record => self.delayed_capture = Some((Instant::now() + Duration::from_millis(250), Mode::Record, None)),
+            Cmd::Stop => self.stop_recording(),
             Cmd::PinHistory(id) => self.pin_history(el, id),
             Cmd::ClearHistory => self.history.clear(),
             Cmd::ClosePins => self.close_pins(),
@@ -916,6 +928,11 @@ impl App {
             Cmd::SetFps(f) => {
                 self.settings.fps = f;
                 self.settings.save();
+            }
+            Cmd::SetFormat(f) => {
+                self.settings.format = f;
+                self.settings.save();
+                editor::set_record_format(f);
             }
             Cmd::ToggleAutostart => {
                 if !settings::set_autostart(!settings::autostart_enabled()) {
@@ -998,7 +1015,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::SaveTo(choice) => self.save_chosen(el, choice),
             UserEvent::ColorChosen { color, outline } => self.color_chosen(color, outline),
             UserEvent::CastStarted(result) => {
-                let pending = self.pending_gif.take();
+                let pending = self.pending_rec.take();
                 match (result, pending) {
                     (Ok(cast), Some((req, screen))) => {
                         if let Some(token) = &cast.restore_token {
@@ -1011,7 +1028,7 @@ impl ApplicationHandler<UserEvent> for App {
                     (Ok(_), None) => {}
                 }
             }
-            UserEvent::RecordingDone(out) => self.gif_done(out),
+            UserEvent::RecordingDone(out) => self.recording_done(out),
             UserEvent::ShortcutsUnavailable(reason) => {
                 eprintln!("global shortcuts unavailable: {reason}");
                 if !self.settings.shortcut_hint_shown {
@@ -1022,7 +1039,7 @@ impl ApplicationHandler<UserEvent> for App {
                         &format!(
                             "Your desktop doesn't let apps register shortcuts. In Settings → Keyboard → Custom Shortcuts, \
                              add PrtSc running “{0} --capture”, Ctrl+PrtSc running “{0} --pin” and Shift+PrtSc \
-                             running “{0} --gif”.",
+                             running “{0} --record”.",
                             exe()
                         ),
                     );
@@ -1050,8 +1067,8 @@ impl ApplicationHandler<UserEvent> for App {
             _ => None,
         };
         match clicked {
-            Some(BarBtn::Stop) => self.stop_gif(),
-            Some(BarBtn::Cancel) => self.cancel_gif(),
+            Some(BarBtn::Stop) => self.stop_recording(),
+            Some(BarBtn::Cancel) => self.cancel_recording(),
             None => {}
         }
     }

@@ -1,8 +1,8 @@
 [package]
 name = "screen-capture"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
-description = "Lightshot-style screen capture for Windows and Linux: region screenshots, annotations, clipboard and GIF recording"
+description = "Lightshot-style screen capture for Windows and Linux: region screenshots, annotations, clipboard and GIF/MP4 recording"
 license = "MIT"
 authors = ["Pixobit Solutions"]
 homepage = "https://pixobit.eu"
@@ -18,7 +18,8 @@ png = "0.17"
 rayon = "1.10"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 
-# WinRT projections, only for the OCR engine built into Windows.
+# WinRT projections for the OCR engine built into Windows, and the Media
+# Foundation interfaces for MP4 recording.
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
@@ -28,6 +29,7 @@ features = [
     "Graphics_Imaging",
     "Media_Ocr",
     "Storage_Streams",
+    "Win32_Media_MediaFoundation",
     "Win32_System_WinRT",
 ]
 
@@ -62,6 +64,9 @@ futures-util = "0.3"
 ksni = { version = "0.3", features = ["blocking"] }
 libc = "0.2"
 notify-rust = "4"
+# H.264 for MP4 recording (Linux has no system encoder to rely on); compiled
+# from source, so building needs a C++ compiler.
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
 pipewire = "0.8"
 softbuffer = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

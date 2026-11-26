@@ -10,7 +10,7 @@ pub const MAKER: &str = "Pixobit Solutions";
 pub const HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
 pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
-/// Where recorded GIFs (and quick saves) go.
+/// Where recordings (and quick saves) go.
 pub fn captures_dir() -> PathBuf {
     pictures_dir().join(APP_NAME)
 }

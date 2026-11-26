@@ -1,6 +1,6 @@
 //! X11 screen access: monitors, the pointer, screen pixels (GetImage on the
 //! root window), the window list for click-to-select, and a frame grabber
-//! for GIF recording that draws the real cursor (XFixes).
+//! for recording that draws the real cursor (XFixes).
 //!
 //! On Wayland, screenshots come from the desktop portal instead (see
 //! `portal.rs`).
@@ -161,7 +161,7 @@ impl X11 {
     }
 }
 
-/// Repeatedly captures one rectangle for GIF recording.
+/// Repeatedly captures one rectangle for recording.
 pub struct Grabber {
     x: X11,
     w: i32,

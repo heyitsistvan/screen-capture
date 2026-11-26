@@ -1,9 +1,10 @@
-//! The floating bar shown while recording a GIF: a blinking dot, elapsed
+//! The floating bar shown while recording: a blinking dot, elapsed
 //! time, frame count and Stop/discard buttons, then encoding progress. Drawn
 //! the same on every platform; each platform's window supplies state, clicks
 //! and presentation.
 
 use crate::annotate::Rgba;
+use crate::recording::Format;
 use crate::text::{self, Fonts};
 use crate::ui::{Canvas, Icon};
 use crate::util::Rect;
@@ -22,6 +23,7 @@ pub struct BarState {
     pub elapsed_ms: u64,
     pub frames: usize,
     pub processed: usize,
+    pub format: Format,
 }
 
 fn px(v: f32, scale: f32) -> i32 {
@@ -78,7 +80,8 @@ pub fn draw(cv: &mut Canvas, scale: f32, st: &BarState, hover: Option<BarBtn>, f
     } else {
         let total = st.frames.max(1);
         let pct = st.processed.min(total) * 100 / total;
-        cv.text(x, ty, &format!("Encoding GIF…  {pct}%"), fpx, Rgba(255, 255, 255, 255), &fonts.ui);
+        let label = format!("Encoding {}…  {pct}%", st.format.label());
+        cv.text(x, ty, &label, fpx, Rgba(255, 255, 255, 255), &fonts.ui);
         let track = Rect::new(px(14.0, s), h - px(6.0, s), w - px(54.0, s), h - px(3.0, s));
         cv.fill_rrect(track, 1.5 * s, Rgba(255, 255, 255, 35));
         let fill = Rect::new(track.l, track.t, track.l + (track.w() as usize * pct / 100) as i32, track.b);
